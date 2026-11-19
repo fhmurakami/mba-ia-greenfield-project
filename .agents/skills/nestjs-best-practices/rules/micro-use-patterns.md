@@ -15,7 +15,7 @@ NestJS microservices support two communication patterns: request-response (Messa
 // Use @MessagePattern for fire-and-forget
 @Controller()
 export class NotificationsController {
-  @MessagePattern('user.created')
+  @MessagePattern("user.created")
   async handleUserCreated(data: UserCreatedEvent) {
     // This WAITS for response, blocking the sender
     await this.emailService.sendWelcome(data.email);
@@ -26,7 +26,7 @@ export class NotificationsController {
 // Use @EventPattern expecting a response
 @Controller()
 export class OrdersController {
-  @EventPattern('inventory.check')
+  @EventPattern("inventory.check")
   async checkInventory(data: CheckInventoryDto) {
     const available = await this.inventory.check(data);
     return available; // This return value is IGNORED with @EventPattern!
@@ -40,7 +40,7 @@ export class UsersService {
     const user = await this.repo.save(dto);
 
     // Blocks until notification service responds
-    await this.client.send('user.created', user).toPromise();
+    await this.client.send("user.created", user).toPromise();
     // If notification service is down, user creation fails!
 
     return user;
@@ -74,7 +74,7 @@ export class OrdersService {
     );
 
     if (!inventory.available) {
-      throw new BadRequestException('Insufficient inventory');
+      throw new InsufficientInventoryException(dto.productId, dto.quantity);
     }
 
     return this.repo.save(dto);
@@ -126,7 +126,7 @@ export class OrdersService {
 
     if (!reserved.success) {
       await this.repo.delete(order.id);
-      throw new BadRequestException('Could not reserve inventory');
+      throw new InventoryReservationFailedException(order.id);
     }
 
     // Non-critical: notifications (use EventPattern)
