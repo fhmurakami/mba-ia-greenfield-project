@@ -86,7 +86,7 @@ green-field-ia-project/
 │   ├── test/                            # Testes e2e
 │   ├── compose.yaml                     # Docker Compose (API + PostgreSQL)
 │   └── Dockerfile.dev                   # Dockerfile de desenvolvimento
-├── CLAUDE.md                            # Instruções para IA
+├── AGENTS.md                            # Instruções para IA
 ├── whiteboard.png                       # Quadro branco do projeto
 └── README.md
 ```
