@@ -18,6 +18,7 @@ description: "Testing conventions for NestJS unit and e2e tests"
 
 - Place integration tests next to the source file they test, same directory as unit tests
 - Use a real database — connect to the Docker `db` service (env vars from `.env` are available inside the container)
+- **Never use `localhost` / `127.0.0.1` for container services in tests:** tests run inside the `nestjs-api` container, where `localhost` is `nestjs-api` itself. Always use Docker Compose service names (e.g., `db` for PostgreSQL, or the respective service name for queue/SMTP/storage — never `?? 'localhost'` fallbacks or `http://localhost:...` URLs to sibling containers).
 - **Table cleanup:** `repository.delete({})` throws `Empty criteria(s) are not allowed`. Use `dataSource.query('DELETE FROM table_name')` or `repository.clear()` to wipe tables between tests
 
 ## E2E Tests (`*.e2e-spec.ts`)

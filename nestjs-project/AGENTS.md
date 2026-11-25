@@ -36,6 +36,13 @@ Services:
 - `nestjs-api` — NestJS API, port `3000`
 - `db` — PostgreSQL 17, port `5432`, database `streamtube`, user/password `streamtube`
 
+### Container Networking
+
+Inside a Docker container, `localhost` (`127.0.0.1`) resolves **only to that container itself** — never to `db` or any other sibling container.
+
+- **Inside containers (`nestjs-api`, tests, seeds, migrations, configs, `.env`, `.env.example`):** always connect to infrastructure services using their **Docker Compose service name** from `compose.yaml` (e.g., `DB_HOST=db`, default `'db'` in `registerAs` / Joi schemas — **never** `'localhost'`). The same rule applies to any future containerized service (queue/Redis, S3/MinIO, SMTP/Mailpit).
+- **On the host machine (`curl`, browser, host MCP tools):** use `localhost` with the published port (e.g., `curl http://localhost:3000`).
+
 All verification and teardown commands run on the **host machine**:
 
 ```bash
