@@ -31,7 +31,7 @@ After reading all context sources, validate the inputs before producing any outp
 
 - Capabilities described too vaguely to decompose into actionable step implementations (e.g., "handle authentication" — which flows exactly?).
 - Unclear boundaries — is a capability part of this phase or the next?
-- Missing edge cases that will surface during implementation (e.g., "user login" but no mention of what happens when email is unconfirmed).
+- Missing edge cases visible from reading the spec (e.g., "user login" but no mention of what happens when email is unconfirmed). Flag here only gaps apparent from static reading; edge cases that require tracing execution paths belong to "Unmapped consequences" below.
 
 **Missing decisions:**
 
@@ -44,7 +44,19 @@ After reading all context sources, validate the inputs before producing any outp
 - Phase depends on something from a previous phase that was not planned or delivered.
 - Circular or missing dependencies between capabilities within the phase.
 
-**If any issues are found:** stop and present them to the user before generating the plan. Group issues by type (inconsistency, ambiguity, missing decision, dependency gap). Be specific — quote the conflicting statements or point to the exact capability that is unclear. Wait for the user to resolve them. Once the user confirms resolutions (typically by updating `docs/decisions/` or the phase scope in `docs/project-plan.md`), re-read the affected sources and re-run the validation checks before generating the plan.
+**Unmapped consequences of functional requirements:**
+
+Unlike the categories above — which compare documents against each other statically — this one requires mentally simulating each functional requirement's execution and checking whether all consequences are addressed. For every capability in the phase, walk through the operation step by step and ask:
+
+- **What are the inputs, and what are their edge cases?** Consider realistic variance in the data that triggers the operation (e.g., "channel handle from email prefix" — what if two users share the same prefix? What if the prefix is empty, one character, or 200 characters? What if it contains only special characters that get stripped?).
+- **What does this operation produce, and can those outputs collide, overflow, or violate constraints?** Trace each derived or generated value to where it is stored or used. Check whether uniqueness constraints, length limits, format requirements, or downstream consumers can be violated by legitimate inputs (e.g., a derived handle that is unique in the spec but not unique in practice given the derivation rule).
+- **What happens to related entities and side effects?** When the operation creates, modifies, or deletes data, trace the impact on every entity it touches directly or transitively. Ask whether cascading effects, ordering dependencies, or state transitions in related entities are specified (e.g., "delete user" — are their videos, comments, and upload jobs handled? "change email" — does the channel handle update too, or is it frozen?).
+- **What happens under concurrency or repeated execution?** Consider whether two users or two requests performing the same operation simultaneously could produce race conditions, duplicate records, or inconsistent states not addressed by the specs (e.g., two simultaneous registrations with the same email, concurrent refresh token rotations).
+- **Is the failure path specified?** For each step that can fail, check whether the specs define what happens — rollback behavior, error response, user-facing message, or cleanup of partial state (e.g., "registration creates user + channel" — what if channel creation fails after the user row is inserted? Is it transactional?).
+
+The goal is not to enumerate every possible edge case exhaustively, but to simulate realistic execution paths and flag consequences that no document currently addresses. Report each finding the same way as other validation issues: quote the requirement, describe the unmapped consequence, and ask the user to decide.
+
+**If any issues are found:** stop and present them to the user before generating the plan. Group issues by type (inconsistency, ambiguity, missing decision, dependency gap, unmapped consequence). Be specific — quote the conflicting statements or point to the exact capability that is unclear. Wait for the user to resolve them. Once the user confirms resolutions (typically by updating `docs/decisions/` for the current phase, the phase scope in `docs/project-plan.md`, or providing explicit out-of-scope decisions for unmapped consequences), re-read the affected sources and re-run the validation checks before generating the plan.
 
 **If no issues are found:** proceed to generate the plan.
 
@@ -131,12 +143,13 @@ _(include only the subsections that apply to the phase — see applicability che
 
 - field: type, required/optional — constraints
 
-**Response NNN:**
+**Response 2XX:** _(choose based on REST Conventions: 200 for data, 201 for creation, 204 for no content)_
 
-- field: type
+- field: type _(omit entire section for 204 — no body)_
 
-**Response headers:** (if applicable)
+**Response headers:** _(if applicable)_
 
+- Location: /resource/:id _(for 201 when GET endpoint exists)_
 - Header-Name: description
 
 **Error responses:**
@@ -267,6 +280,12 @@ Use these sentence patterns. Replace the bracketed placeholders with specifics f
 
 Example: `POST /auth/register with an already-registered email returns 409 with EMAIL_ALREADY_EXISTS`
 
+For 204 No Content responses (action endpoints with no response body):
+
+    [METHOD] [/path] with [input description] returns 204 with no response body — [observable side effect]
+
+Example: `POST /auth/logout with a valid access token returns 204 with no response body — all user's refresh tokens are revoked`
+
 **Database/persistence behavior** (constraint enforcement, atomicity, data integrity):
 
     [operation description] — [expected persistence outcome or constraint violation]
@@ -366,6 +385,41 @@ Write the plan file incrementally, not in a single large write. This bounds each
 
 **Handling unresolved ambiguities during drafting:** If you reach a point where a decision is missing and was not caught during Validation, insert an inline marker `[DECIDE: option A | option B — brief context]` in the draft and continue. When the draft is complete, present all markers to the user via `AskUserQuestion` (one question per marker). `AskUserQuestion` accepts up to 4 questions per call, so if there are ≤4 markers use a single call; if there are more, issue sequential calls of up to 4 questions each until all markers are resolved. Apply the answers with targeted `Edit` calls. This avoids breaking the drafting flow with mid-stream questions.
 
+## REST Conventions for API Contracts
+
+When specifying API contracts, follow these conventions to ensure the plan produces RESTful, standards-compliant endpoint definitions.
+
+### Success Status Code Selection
+
+| Status             | When to use                                                                                                           | Response body                                                                    |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| **200 OK**         | Operation succeeded and returns meaningful data (resource representation, token pair, search results, computed value) | Yes — the resource or data produced                                              |
+| **201 Created**    | POST that creates a new identifiable resource                                                                         | Yes — representation of the created resource (at minimum: ID + essential fields) |
+| **204 No Content** | Operation succeeded with nothing meaningful to return                                                                 | **None** — no response body at all                                               |
+| **202 Accepted**   | Operation accepted for asynchronous processing — result not yet available                                             | Optional — reference to the job/task for polling                                 |
+
+### Response Body Rules
+
+The body of a success response contains the **representation of the resource/data produced** or **nothing** (204). Never return `{ message: "..." }` as the sole content of a success response — the HTTP status code already communicates the outcome.
+
+Decision guide:
+
+- **Endpoint creates a resource** (register user, create video) → 201 + resource representation
+- **Endpoint returns data** (login → tokens, search → results) → 200 + data
+- **Endpoint executes an action without producing data** (logout, confirm email, revoke token, send email) → 204 with no body
+- **Security-neutral endpoint** (forgot-password, resend-confirmation — always returns the same response regardless of input to avoid leaking information) → 204 with no body (the absence of a body naturally prevents information leakage)
+
+### Location Header for 201 Created
+
+When the created resource has a retrieval endpoint (GET), include a `Location` response header pointing to the resource URI (e.g., `Location: /users/:id`). Omit when no GET endpoint exists for the resource in the current phase.
+
+### Action Endpoints vs. Resource Endpoints
+
+Not every endpoint maps to CRUD on a resource. Action endpoints (login, logout, confirm, reset) are valid in REST. The rule:
+
+- Action that **produces a result** (login → tokens) → 200 with the result
+- Action that **triggers a side effect without producing data** (logout, confirm) → 204 with no body
+
 ## How to write Technical Specifications
 
 Not every phase needs all specification sections. Use this checklist to decide which to include:
@@ -399,6 +453,8 @@ Specify for each endpoint:
 - Reference the step implementation that implements the endpoint (e.g., SI-02.1).
 
 When validation rules are simple (2-3 constraints per field), describe them inline in the request body. When extensive, group them in a separate **Validation Rules** subsection per endpoint or per entity.
+
+**Status code and response body:** Follow the REST conventions defined in "REST Conventions for API Contracts" above. In particular: use 204 No Content for endpoints that succeed without producing data — do not invent `{ message: "..." }` wrappers. Use 201 Created for POST endpoints that create resources.
 
 ### Authorization Matrix
 
