@@ -76,7 +76,7 @@ Deliver the complete authentication lifecycle — registration with automatic ch
 | ------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | `src/users/entities/user.entity.integration-spec.ts`    | Integration | Unique email constraint, `password` excluded from default SELECT, `is_confirmed` defaults to `false`, timestamps auto-populated |
 | `src/users/entities/channel.entity.integration-spec.ts` | Integration | Unique nickname constraint, nickname max length (50), one-to-one relation with user, `description` nullable                     |
-| `src/users/users.module.spec.ts`                        | Unit        | Module compiles with TypeOrmModule.forFeature wiring                                                                            |
+| `src/users/users.module.integration-spec.ts`            | Integration | Module compiles with TypeOrmModule.forFeature wiring                                                                            |
 
 **Dependencies:** SI-02.1
 
