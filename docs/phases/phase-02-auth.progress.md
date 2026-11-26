@@ -1,7 +1,7 @@
 # Phase 02 — Cadastro, Login e Gerenciamento de Conta — Progress
 
 **Status:** in_progress
-**SIs:** 1/13 completed
+**SIs:** 2/13 completed
 
 ### SI-02.1 — Dependencies, Configuration Namespaces, and Docker Compose
 
@@ -11,8 +11,8 @@
 
 ### SI-02.2 — Global ValidationPipe and Domain Exception Filter
 
-- **Status:** pending
-- **Tests:** pending
+- **Status:** completed
+- **Tests:** 2 suites passed (12 tests)
 - **Observations:** none
 
 ### SI-02.3 — User and Channel Entities
