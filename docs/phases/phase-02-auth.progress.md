@@ -1,7 +1,7 @@
 # Phase 02 — Cadastro, Login e Gerenciamento de Conta — Progress
 
 **Status:** in_progress
-**SIs:** 3/13 completed
+**SIs:** 4/13 completed
 
 ### SI-02.1 — Dependencies, Configuration Namespaces, and Docker Compose
 
@@ -23,8 +23,8 @@
 
 ### SI-02.4 — RefreshToken and VerificationToken Entities
 
-- **Status:** pending
-- **Tests:** pending
+- **Status:** completed
+- **Tests:** 2 suites passed (9 tests)
 - **Observations:** none
 
 ### SI-02.5 — Mail Module and Email Templates
