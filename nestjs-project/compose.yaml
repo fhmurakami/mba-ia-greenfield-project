@@ -15,9 +15,20 @@ services:
       - DB_USERNAME=streamtube
       - DB_PASSWORD=streamtube
       - DB_NAME=streamtube
+      - JWT_SECRET=dev-jwt-secret-change-in-production
+      - JWT_REFRESH_SECRET=dev-jwt-refresh-secret-change-in-production
+      - JWT_ACCESS_EXPIRATION=15m
+      - JWT_REFRESH_EXPIRATION=7d
+      - CONFIRMATION_TOKEN_EXPIRATION_HOURS=1
+      - PASSWORD_RESET_TOKEN_EXPIRATION_HOURS=1
+      - MAIL_HOST=mailpit
+      - MAIL_PORT=1025
+      - 'MAIL_FROM="StreamTube" <noreply@streamtube.com>'
     depends_on:
       db:
         condition: service_healthy
+      mailpit:
+        condition: service_started
 
   db:
     image: postgres:17
@@ -32,3 +43,9 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  mailpit:
+    image: axllent/mailpit
+    ports:
+      - "1025:1025"
+      - "8025:8025"
