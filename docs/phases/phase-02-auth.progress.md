@@ -1,7 +1,7 @@
 # Phase 02 — Cadastro, Login e Gerenciamento de Conta — Progress
 
 **Status:** in_progress
-**SIs:** 5/13 completed
+**SIs:** 6/13 completed
 
 ### SI-02.1 — Dependencies, Configuration Namespaces, and Docker Compose
 
@@ -35,9 +35,9 @@
 
 ### SI-02.6 — User Registration with Automatic Channel Creation
 
-- **Status:** pending
-- **Tests:** pending
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 6 suites passed (53 tests)
+- **Observations:** `UsersService` (`existsByEmail`, `createUserWithChannel`, `findByEmail`) and `AuthService.register` normalize emails via `trim().toLowerCase()` before duplicate checks, persistence, and sending confirmation emails. `UsersService.createUserWithChannel` accepts an optional external `EntityManager` (used by `AuthService.register` so user, channel, and verification token are persisted atomically in the same `dataSource.transaction(...)` while `mailService.sendConfirmationEmail` runs outside), translates PostgreSQL `23505` `(email)=` violations to `EmailAlreadyExistsException`, and uses a nested `txManager.transaction()` savepoint around each `Channel` insert so `23505` nickname collisions retry with `appendRandomSuffix` without aborting the outer transaction. Context7 docs for `class-validator` served `v0.15.1` (closest to installed `^0.14.4`), with identical `@IsEmail`, `@IsString`, `@MinLength`, and `@MaxLength` decorator signatures and default messages. Extracted reusable DB connection and cleanup helpers into `test/create-test-data-source.ts` (`getTestTypeOrmOptions`, `createTestDataSource`, `clearTestTables`) and split long `it` blocks into focused assertions.
 
 ### SI-02.7 — Email Confirmation (Confirm and Resend)
 
@@ -80,3 +80,7 @@
 - **Status:** pending
 - **Tests:** pending
 - **Observations:** none
+
+## Out-of-Scope Tasks
+
+- [ ] Extract duplicated global pipes/filters configuration between `src/main.ts` and `test/auth.e2e-spec.ts` into a shared bootstrap helper (per `testing-guide-nestjs-project/references/gotchas.md` §2).

@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { DataSource, Repository } from 'typeorm';
-import databaseConfig from '../../config/database.config';
+import {
+  clearTestTables,
+  createTestDataSource,
+} from '../../../test/create-test-data-source';
 import { Channel } from '../../users/entities/channel.entity';
 import { User } from '../../users/entities/user.entity';
 import { RefreshToken } from './refresh-token.entity';
@@ -11,18 +14,7 @@ describe('RefreshToken entity (integration)', () => {
   let refreshTokenRepository: Repository<RefreshToken>;
 
   beforeAll(async () => {
-    const dbConfig = databaseConfig();
-    dataSource = new DataSource({
-      type: 'postgres',
-      host: dbConfig.host,
-      port: dbConfig.port,
-      username: dbConfig.username,
-      password: dbConfig.password,
-      database: dbConfig.database,
-      entities: [User, Channel, RefreshToken],
-      synchronize: false,
-    });
-    await dataSource.initialize();
+    dataSource = await createTestDataSource([User, Channel, RefreshToken]);
     userRepository = dataSource.getRepository(User);
     refreshTokenRepository = dataSource.getRepository(RefreshToken);
   });
@@ -32,9 +24,7 @@ describe('RefreshToken entity (integration)', () => {
   });
 
   beforeEach(async () => {
-    await dataSource.query(
-      'TRUNCATE TABLE "refresh_tokens", "channels", "users" RESTART IDENTITY CASCADE',
-    );
+    await clearTestTables(dataSource);
   });
 
   it('should persist refresh token linked to user, query by token_hash, and update revoked_at', async () => {

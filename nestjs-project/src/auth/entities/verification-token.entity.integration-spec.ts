@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { DataSource, Repository } from 'typeorm';
-import databaseConfig from '../../config/database.config';
+import {
+  clearTestTables,
+  createTestDataSource,
+} from '../../../test/create-test-data-source';
 import { Channel } from '../../users/entities/channel.entity';
 import { User } from '../../users/entities/user.entity';
 import {
@@ -14,18 +17,7 @@ describe('VerificationToken entity (integration)', () => {
   let verificationTokenRepository: Repository<VerificationToken>;
 
   beforeAll(async () => {
-    const dbConfig = databaseConfig();
-    dataSource = new DataSource({
-      type: 'postgres',
-      host: dbConfig.host,
-      port: dbConfig.port,
-      username: dbConfig.username,
-      password: dbConfig.password,
-      database: dbConfig.database,
-      entities: [User, Channel, VerificationToken],
-      synchronize: false,
-    });
-    await dataSource.initialize();
+    dataSource = await createTestDataSource([User, Channel, VerificationToken]);
     userRepository = dataSource.getRepository(User);
     verificationTokenRepository = dataSource.getRepository(VerificationToken);
   });
@@ -35,9 +27,7 @@ describe('VerificationToken entity (integration)', () => {
   });
 
   beforeEach(async () => {
-    await dataSource.query(
-      'TRUNCATE TABLE "verification_tokens", "channels", "users" RESTART IDENTITY CASCADE',
-    );
+    await clearTestTables(dataSource);
   });
 
   it('should persist email_confirmation and password_reset tokens, query by token_hash, and update used_at', async () => {

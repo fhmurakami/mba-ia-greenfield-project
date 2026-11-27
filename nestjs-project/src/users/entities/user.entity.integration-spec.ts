@@ -1,5 +1,8 @@
 import { DataSource, Repository } from 'typeorm';
-import databaseConfig from '../../config/database.config';
+import {
+  clearTestTables,
+  createTestDataSource,
+} from '../../../test/create-test-data-source';
 import { Channel } from './channel.entity';
 import { User } from './user.entity';
 
@@ -8,18 +11,7 @@ describe('User entity (integration)', () => {
   let userRepository: Repository<User>;
 
   beforeAll(async () => {
-    const dbConfig = databaseConfig();
-    dataSource = new DataSource({
-      type: 'postgres',
-      host: dbConfig.host,
-      port: dbConfig.port,
-      username: dbConfig.username,
-      password: dbConfig.password,
-      database: dbConfig.database,
-      entities: [User, Channel],
-      synchronize: false,
-    });
-    await dataSource.initialize();
+    dataSource = await createTestDataSource([User, Channel]);
     userRepository = dataSource.getRepository(User);
   });
 
@@ -28,9 +20,7 @@ describe('User entity (integration)', () => {
   });
 
   beforeEach(async () => {
-    await dataSource.query(
-      'TRUNCATE TABLE "channels", "users" RESTART IDENTITY CASCADE',
-    );
+    await clearTestTables(dataSource);
   });
 
   it('should default is_confirmed to false and auto-populate id, created_at, and updated_at', async () => {

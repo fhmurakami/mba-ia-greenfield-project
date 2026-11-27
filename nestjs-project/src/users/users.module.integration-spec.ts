@@ -1,7 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken, TypeOrmModule } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import databaseConfig from '../config/database.config';
+import { getTestTypeOrmOptions } from '../../test/create-test-data-source';
 import { Channel } from './entities/channel.entity';
 import { User } from './entities/user.entity';
 import { UsersModule } from './users.module';
@@ -10,21 +10,8 @@ describe('UsersModule (integration)', () => {
   let moduleRef: TestingModule;
 
   beforeAll(async () => {
-    const dbConfig = databaseConfig();
     moduleRef = await Test.createTestingModule({
-      imports: [
-        TypeOrmModule.forRoot({
-          type: 'postgres',
-          host: dbConfig.host,
-          port: dbConfig.port,
-          username: dbConfig.username,
-          password: dbConfig.password,
-          database: dbConfig.database,
-          autoLoadEntities: true,
-          synchronize: false,
-        }),
-        UsersModule,
-      ],
+      imports: [TypeOrmModule.forRoot(getTestTypeOrmOptions()), UsersModule],
     }).compile();
   });
 

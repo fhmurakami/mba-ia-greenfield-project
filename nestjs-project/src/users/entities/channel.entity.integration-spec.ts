@@ -1,5 +1,8 @@
 import { DataSource, Repository } from 'typeorm';
-import databaseConfig from '../../config/database.config';
+import {
+  clearTestTables,
+  createTestDataSource,
+} from '../../../test/create-test-data-source';
 import { Channel } from './channel.entity';
 import { User } from './user.entity';
 
@@ -9,18 +12,7 @@ describe('Channel entity (integration)', () => {
   let channelRepository: Repository<Channel>;
 
   beforeAll(async () => {
-    const dbConfig = databaseConfig();
-    dataSource = new DataSource({
-      type: 'postgres',
-      host: dbConfig.host,
-      port: dbConfig.port,
-      username: dbConfig.username,
-      password: dbConfig.password,
-      database: dbConfig.database,
-      entities: [User, Channel],
-      synchronize: false,
-    });
-    await dataSource.initialize();
+    dataSource = await createTestDataSource([User, Channel]);
     userRepository = dataSource.getRepository(User);
     channelRepository = dataSource.getRepository(Channel);
   });
@@ -30,9 +22,7 @@ describe('Channel entity (integration)', () => {
   });
 
   beforeEach(async () => {
-    await dataSource.query(
-      'TRUNCATE TABLE "channels", "users" RESTART IDENTITY CASCADE',
-    );
+    await clearTestTables(dataSource);
   });
 
   it('should persist channel with nullable description and one-to-one relation to user', async () => {
