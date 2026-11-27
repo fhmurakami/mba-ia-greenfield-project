@@ -10,6 +10,7 @@ services:
     environment:
       - NODE_ENV=development
       - PORT=3000
+      - APP_URL=https://streamtube.com
       - DB_HOST=db
       - DB_PORT=5432
       - DB_USERNAME=streamtube

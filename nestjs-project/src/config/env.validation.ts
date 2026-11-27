@@ -5,6 +5,7 @@ export const envValidationSchema = Joi.object({
     .valid('development', 'production', 'test')
     .default('development'),
   PORT: Joi.number().port().default(3000),
+  APP_URL: Joi.string().uri().default('https://streamtube.com'),
   DB_HOST: Joi.string().default('db'),
   DB_PORT: Joi.number().default(5432),
   DB_USERNAME: Joi.string().required(),
