@@ -1,6 +1,7 @@
 import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { ConfirmEmailDto } from './dto/confirm-email.dto';
+import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ResendConfirmationDto } from './dto/resend-confirmation.dto';
 
@@ -23,5 +24,13 @@ export class AuthController {
   @HttpCode(HttpStatus.NO_CONTENT)
   async resendConfirmation(@Body() dto: ResendConfirmationDto): Promise<void> {
     await this.authService.resendConfirmation(dto.email);
+  }
+
+  @Post('login')
+  @HttpCode(HttpStatus.OK)
+  login(
+    @Body() dto: LoginDto,
+  ): Promise<{ access_token: string; refresh_token: string }> {
+    return this.authService.login(dto);
   }
 }

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import * as argon2 from 'argon2';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, type ConfigType } from '@nestjs/config';
+import { JwtService } from '@nestjs/jwt';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken, TypeOrmModule } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
@@ -15,6 +16,8 @@ import {
 } from '../../test/mailpit';
 import {
   EmailAlreadyExistsException,
+  EmailNotConfirmedException,
+  InvalidCredentialsException,
   InvalidTokenException,
   TokenExpiredException,
 } from '../common/exceptions/domain.exception';
@@ -51,7 +54,10 @@ describe('AuthService (integration)', () => {
   let moduleRef: TestingModule;
   let authService: AuthService;
   let usersService: UsersService;
+  let jwtService: JwtService;
+  let authCfg: ConfigType<typeof authConfig>;
   let dataSource: DataSource;
+  let refreshTokenRepository: Repository<RefreshToken>;
   let verificationTokenRepository: Repository<VerificationToken>;
 
   beforeAll(async () => {
@@ -75,7 +81,12 @@ describe('AuthService (integration)', () => {
 
     authService = moduleRef.get(AuthService);
     usersService = moduleRef.get(UsersService);
+    jwtService = moduleRef.get(JwtService);
+    authCfg = moduleRef.get<ConfigType<typeof authConfig>>(authConfig.KEY);
     dataSource = moduleRef.get(DataSource);
+    refreshTokenRepository = moduleRef.get<Repository<RefreshToken>>(
+      getRepositoryToken(RefreshToken),
+    );
     verificationTokenRepository = moduleRef.get<Repository<VerificationToken>>(
       getRepositoryToken(VerificationToken),
     );
@@ -453,6 +464,116 @@ describe('AuthService (integration)', () => {
         }),
       ).toBe(1);
       expect(await getMailpitMessages()).toHaveLength(0);
+    });
+  });
+
+  describe('login', () => {
+    const registerConfirmedUser = async (
+      email: string,
+      password = 'MySecretPassword123',
+    ): Promise<{ id: string; email: string }> => {
+      const registered = await authService.register({ email, password });
+      const rawToken = await extractConfirmationTokenFromLatestEmail();
+      await authService.confirm(rawToken);
+      return registered;
+    };
+
+    it('should return verifiable access and refresh tokens and persist refresh token in database', async () => {
+      const registered = await registerConfirmedUser('login-int@example.com');
+
+      const result = await authService.login({
+        email: '  Login-Int@Example.com  ',
+        password: 'MySecretPassword123',
+      });
+
+      const accessPayload = jwtService.verify<{
+        sub: string;
+        email: string;
+      }>(result.access_token);
+      expect(accessPayload.sub).toBe(registered.id);
+      expect(accessPayload.email).toBe('login-int@example.com');
+
+      const refreshPayload = jwtService.verify<{
+        sub: string;
+        family: string;
+        jti: string;
+        exp: number;
+      }>(result.refresh_token, { secret: authCfg.jwtRefreshSecret });
+      expect(refreshPayload.sub).toBe(registered.id);
+      expect(refreshPayload.family).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      );
+
+      const expectedHash = createHash('sha256')
+        .update(result.refresh_token)
+        .digest('hex');
+      const storedToken = await refreshTokenRepository.findOneBy({
+        token_hash: expectedHash,
+      });
+      expect(storedToken).not.toBeNull();
+      expect(storedToken?.user_id).toBe(registered.id);
+      expect(storedToken?.family).toBe(refreshPayload.family);
+      expect(storedToken?.revoked_at).toBeNull();
+      expect(storedToken?.expires_at.getTime()).toBe(refreshPayload.exp * 1000);
+    });
+
+    it('should create distinct rotation families on consecutive logins', async () => {
+      const registered = await registerConfirmedUser('multi-login@example.com');
+
+      const first = await authService.login({
+        email: 'multi-login@example.com',
+        password: 'MySecretPassword123',
+      });
+      const second = await authService.login({
+        email: 'multi-login@example.com',
+        password: 'MySecretPassword123',
+      });
+
+      const firstRefresh = jwtService.verify<{ family: string }>(
+        first.refresh_token,
+        { secret: authCfg.jwtRefreshSecret },
+      );
+      const secondRefresh = jwtService.verify<{ family: string }>(
+        second.refresh_token,
+        { secret: authCfg.jwtRefreshSecret },
+      );
+
+      expect(firstRefresh.family).not.toBe(secondRefresh.family);
+      expect(
+        await refreshTokenRepository.count({
+          where: { user_id: registered.id },
+        }),
+      ).toBe(2);
+    });
+
+    it('should reject unknown email, wrong password, and unconfirmed user without persisting refresh tokens', async () => {
+      await authService.register({
+        email: 'unconfirmed-login@example.com',
+        password: 'MySecretPassword123',
+      });
+
+      await expect(
+        authService.login({
+          email: 'unknown-login@example.com',
+          password: 'MySecretPassword123',
+        }),
+      ).rejects.toThrow(InvalidCredentialsException);
+
+      await expect(
+        authService.login({
+          email: 'unconfirmed-login@example.com',
+          password: 'WrongPassword123',
+        }),
+      ).rejects.toThrow(InvalidCredentialsException);
+
+      await expect(
+        authService.login({
+          email: 'unconfirmed-login@example.com',
+          password: 'MySecretPassword123',
+        }),
+      ).rejects.toThrow(EmailNotConfirmedException);
+
+      expect(await refreshTokenRepository.count()).toBe(0);
     });
   });
 });

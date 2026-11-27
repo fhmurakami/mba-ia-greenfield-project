@@ -1,18 +1,23 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import * as argon2 from 'argon2';
 import { Inject, Injectable } from '@nestjs/common';
 import type { ConfigType } from '@nestjs/config';
+import { JwtService, type JwtSignOptions } from '@nestjs/jwt';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, EntityManager, IsNull, Repository } from 'typeorm';
 import {
   EmailAlreadyExistsException,
+  EmailNotConfirmedException,
+  InvalidCredentialsException,
   InvalidTokenException,
   TokenExpiredException,
 } from '../common/exceptions/domain.exception';
 import authConfig from '../config/auth.config';
 import { MailService } from '../mail/mail.service';
 import { UsersService } from '../users/users.service';
+import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
+import { RefreshToken } from './entities/refresh-token.entity';
 import {
   VerificationToken,
   VerificationTokenType,
@@ -23,6 +28,9 @@ export class AuthService {
   constructor(
     private readonly usersService: UsersService,
     private readonly mailService: MailService,
+    private readonly jwtService: JwtService,
+    @InjectRepository(RefreshToken)
+    private readonly refreshTokenRepository: Repository<RefreshToken>,
     @InjectRepository(VerificationToken)
     private readonly verificationTokenRepository: Repository<VerificationToken>,
     private readonly dataSource: DataSource,
@@ -71,7 +79,7 @@ export class AuthService {
   }
 
   async confirm(token: string): Promise<void> {
-    const tokenHash = createHash('sha256').update(token).digest('hex');
+    const tokenHash = this.hashToken(token);
     const now = new Date(Date.now());
 
     const verificationToken = await this.verificationTokenRepository.findOne({
@@ -145,6 +153,69 @@ export class AuthService {
     );
   }
 
+  async login(
+    dto: LoginDto,
+  ): Promise<{ access_token: string; refresh_token: string }> {
+    const normalizedEmail = dto.email.trim().toLowerCase();
+    const user = await this.usersService.findByEmail(normalizedEmail);
+    if (!user) {
+      throw new InvalidCredentialsException();
+    }
+
+    const isPasswordValid = await argon2.verify(user.password, dto.password);
+    if (!isPasswordValid) {
+      throw new InvalidCredentialsException();
+    }
+
+    if (!user.is_confirmed) {
+      throw new EmailNotConfirmedException();
+    }
+
+    const accessToken = this.jwtService.sign(
+      { sub: user.id, email: user.email },
+      {
+        expiresIn: this.auth.jwtAccessExpiration as JwtSignOptions['expiresIn'],
+      },
+    );
+
+    const family = randomUUID();
+    const tokenId = randomUUID();
+    const refreshToken = this.jwtService.sign(
+      { sub: user.id, family, jti: tokenId },
+      {
+        secret: this.auth.jwtRefreshSecret,
+        expiresIn: this.auth
+          .jwtRefreshExpiration as JwtSignOptions['expiresIn'],
+      },
+    );
+
+    const decodedRefresh = this.jwtService.decode<{ exp?: number } | null>(
+      refreshToken,
+    );
+    if (!decodedRefresh || typeof decodedRefresh.exp !== 'number') {
+      throw new Error('Refresh token is missing exp claim');
+    }
+
+    const tokenHash = this.hashToken(refreshToken);
+    const refreshTokenEntity = this.refreshTokenRepository.create({
+      token_hash: tokenHash,
+      family,
+      user_id: user.id,
+      expires_at: new Date(decodedRefresh.exp * 1000),
+      revoked_at: null,
+    });
+    await this.refreshTokenRepository.save(refreshTokenEntity);
+
+    return {
+      access_token: accessToken,
+      refresh_token: refreshToken,
+    };
+  }
+
+  private hashToken(raw: string): string {
+    return createHash('sha256').update(raw).digest('hex');
+  }
+
   private async createVerificationToken(
     manager: EntityManager,
     userId: string,
@@ -153,7 +224,7 @@ export class AuthService {
     nowMs: number = Date.now(),
   ): Promise<string> {
     const rawToken = randomBytes(32).toString('hex');
-    const tokenHash = createHash('sha256').update(rawToken).digest('hex');
+    const tokenHash = this.hashToken(rawToken);
     const expiresAt = new Date(nowMs + expirationHours * 60 * 60 * 1000);
 
     const verificationToken = this.verificationTokenRepository.create({

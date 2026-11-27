@@ -1,7 +1,7 @@
 # Phase 02 — Cadastro, Login e Gerenciamento de Conta — Progress
 
 **Status:** in_progress
-**SIs:** 7/13 completed
+**SIs:** 8/13 completed
 
 ### SI-02.1 — Dependencies, Configuration Namespaces, and Docker Compose
 
@@ -47,9 +47,9 @@
 
 ### SI-02.8 — Login with Credential Validation and Token Issuance
 
-- **Status:** pending
-- **Tests:** pending
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 4 suites passed (66 tests)
+- **Observations:** Implemented `LoginDto`, configured `JwtModule.registerAsync` (injecting `authConfig.KEY`) and exported `JwtModule` in `AuthModule`, implemented `AuthService.login` (email normalization via `trim().toLowerCase()`, Argon2 verification before `is_confirmed` check so unconfirmed accounts do not leak existence on wrong password, separate `jwtSecret`/`jwtRefreshSecret` signing, `RefreshToken` persistence with `family`/`jti` UUIDs, SHA-256 `token_hash` via shared `hashToken` helper, and `expires_at` derived from decoded refresh JWT `exp`), and added `POST /auth/login` (`200 OK`). Named the module compilation test `src/auth/auth.module.integration-spec.ts` (instead of `.spec.ts`) per `SI-02.3` PostgreSQL test convention and verified `AuthModule` export contract + default `JwtModule` secret configuration in tests. Context7 verification: `@nestjs/jwt@^11.0.2` exact `11.0.2` docs (`JwtModule.registerAsync`, `JwtService.sign`/`verify`/`decode`, casting string expiration to `JwtSignOptions['expiresIn']`), `argon2@^0.41.1` exact `v0.41.1` docs (`argon2.verify(digest, password)`), `class-validator@^0.14.4` closest `v0.15.1`, `@nestjs/common@^11.0.1` NestJS 11.
 
 ### SI-02.9 — JWT Access Token Guard
 
@@ -84,3 +84,5 @@
 ## Out-of-Scope Tasks
 
 - [ ] Extract duplicated global pipes/filters configuration between `src/main.ts` and `test/auth.e2e-spec.ts` into a shared bootstrap helper (per `testing-guide-nestjs-project/references/gotchas.md` §2).
+- [ ] Type `jwtAccessExpiration` and `jwtRefreshExpiration` as `JwtSignOptions['expiresIn']` in `src/config/auth.config.ts` and validate duration format (e.g., `/^\d+[smhd]$/`) in `src/config/env.validation.ts` so invalid expiration strings fail at startup and redundant type assertions in `AuthModule`/`AuthService` are removed.
+- [ ] Extract duplicated email normalization (`email.trim().toLowerCase()`) between `UsersService` and `AuthService` into a shared utility helper.

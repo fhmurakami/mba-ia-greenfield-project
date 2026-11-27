@@ -1,9 +1,11 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
 import { Test, TestingModule } from '@nestjs/testing';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../src/app.module';
+import { RefreshToken } from '../src/auth/entities/refresh-token.entity';
 import { VerificationToken } from '../src/auth/entities/verification-token.entity';
 import { DomainExceptionFilter } from '../src/common/filters/domain-exception.filter';
 import { ValidationExceptionFilter } from '../src/common/filters/validation-exception.filter';
@@ -20,6 +22,11 @@ import {
 interface RegisterResponseBody {
   id: string;
   email: string;
+}
+
+interface LoginResponseBody {
+  access_token: string;
+  refresh_token: string;
 }
 
 interface ErrorResponseBody {
@@ -44,6 +51,7 @@ describe('AuthController (e2e)', () => {
 
   let app: INestApplication<App>;
   let dataSource: DataSource;
+  let jwtService: JwtService;
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -65,6 +73,7 @@ describe('AuthController (e2e)', () => {
 
     await app.init();
     dataSource = app.get(DataSource);
+    jwtService = app.get(JwtService);
   });
 
   afterAll(async () => {
@@ -502,6 +511,144 @@ describe('AuthController (e2e)', () => {
       expect(body.error).toBe('VALIDATION_ERROR');
       expect(body.message).toEqual(
         expect.arrayContaining(['email must be an email']),
+      );
+    });
+  });
+
+  describe('POST /auth/login', () => {
+    const registerAndConfirmUser = async (
+      email: string,
+    ): Promise<{ userId: string }> => {
+      const { userId, token } = await registerAndGetToken(email);
+      await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({ token })
+        .expect(204);
+      return { userId };
+    };
+
+    it('should return 200 with access_token and refresh_token for confirmed user and persist refresh token', async () => {
+      const { userId } = await registerAndConfirmUser('login-e2e@example.com');
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'Login-E2E@Example.com',
+          password: 'StrongPassword123',
+        })
+        .expect(200);
+
+      const body = response.body as LoginResponseBody;
+      expect(typeof body.access_token).toBe('string');
+      expect(typeof body.refresh_token).toBe('string');
+
+      const accessPayload = jwtService.verify<{
+        sub: string;
+        email: string;
+      }>(body.access_token);
+      expect(accessPayload.sub).toBe(userId);
+      expect(accessPayload.email).toBe('login-e2e@example.com');
+
+      const storedTokens = await dataSource.getRepository(RefreshToken).find({
+        where: { user_id: userId },
+      });
+      expect(storedTokens).toHaveLength(1);
+      expect(storedTokens[0].family).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      );
+      expect(storedTokens[0].revoked_at).toBeNull();
+    });
+
+    it('should return 401 INVALID_CREDENTIALS for unknown email', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'nonexistent@example.com',
+          password: 'StrongPassword123',
+        })
+        .expect(401);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body).toEqual({
+        statusCode: 401,
+        error: 'INVALID_CREDENTIALS',
+        message: 'Invalid email or password',
+      });
+    });
+
+    it('should return 401 INVALID_CREDENTIALS for wrong password', async () => {
+      await registerAndConfirmUser('wrong-pass@example.com');
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'wrong-pass@example.com',
+          password: 'WrongPassword123',
+        })
+        .expect(401);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body).toEqual({
+        statusCode: 401,
+        error: 'INVALID_CREDENTIALS',
+        message: 'Invalid email or password',
+      });
+    });
+
+    it('should return 403 EMAIL_NOT_CONFIRMED for unconfirmed user', async () => {
+      await registerAndGetToken('unconfirmed-e2e@example.com');
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'unconfirmed-e2e@example.com',
+          password: 'StrongPassword123',
+        })
+        .expect(403);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body).toEqual({
+        statusCode: 403,
+        error: 'EMAIL_NOT_CONFIRMED',
+        message: 'Email not confirmed',
+      });
+    });
+
+    it('should return 400 VALIDATION_ERROR when email is invalid or password is missing or empty', async () => {
+      const invalidResponse = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'not-an-email',
+          password: '',
+        })
+        .expect(400);
+
+      const invalidBody = invalidResponse.body as ErrorResponseBody;
+      expect(invalidBody.statusCode).toBe(400);
+      expect(invalidBody.error).toBe('VALIDATION_ERROR');
+      expect(invalidBody.message).toEqual(
+        expect.arrayContaining([
+          'email must be an email',
+          'password should not be empty',
+        ]),
+      );
+
+      const missingPasswordResponse = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'user@example.com',
+        })
+        .expect(400);
+
+      const missingPasswordBody =
+        missingPasswordResponse.body as ErrorResponseBody;
+      expect(missingPasswordBody.statusCode).toBe(400);
+      expect(missingPasswordBody.error).toBe('VALIDATION_ERROR');
+      expect(missingPasswordBody.message).toEqual(
+        expect.arrayContaining([
+          'password should not be empty',
+          'password must be a string',
+        ]),
       );
     });
   });

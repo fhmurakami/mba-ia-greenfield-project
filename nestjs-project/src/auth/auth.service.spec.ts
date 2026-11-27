@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import * as argon2 from 'argon2';
 import type { ConfigType } from '@nestjs/config';
+import { JwtModule, JwtService, type JwtSignOptions } from '@nestjs/jwt';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import {
@@ -12,6 +13,8 @@ import {
 } from 'typeorm';
 import {
   EmailAlreadyExistsException,
+  EmailNotConfirmedException,
+  InvalidCredentialsException,
   InvalidTokenException,
   TokenExpiredException,
 } from '../common/exceptions/domain.exception';
@@ -21,6 +24,7 @@ import { Channel } from '../users/entities/channel.entity';
 import { User } from '../users/entities/user.entity';
 import { UsersService } from '../users/users.service';
 import { AuthService } from './auth.service';
+import { RefreshToken } from './entities/refresh-token.entity';
 import {
   VerificationToken,
   VerificationTokenType,
@@ -38,6 +42,8 @@ const mockAuthConfig: ConfigType<typeof authConfig> = {
 describe('AuthService (unit)', () => {
   let moduleRef: TestingModule;
   let authService: AuthService;
+  let jwtService: JwtService;
+  let validPasswordHash: string;
   let usersService: jest.Mocked<
     Pick<
       UsersService,
@@ -48,6 +54,9 @@ describe('AuthService (unit)', () => {
     >
   >;
   let mailService: jest.Mocked<Pick<MailService, 'sendConfirmationEmail'>>;
+  let refreshTokenRepository: jest.Mocked<
+    Pick<Repository<RefreshToken>, 'create' | 'save'>
+  >;
   let verificationTokenRepository: jest.Mocked<
     Pick<Repository<VerificationToken>, 'create' | 'findOne'>
   >;
@@ -55,6 +64,7 @@ describe('AuthService (unit)', () => {
   let dataSource: jest.Mocked<Pick<DataSource, 'transaction'>>;
 
   beforeAll(async () => {
+    validPasswordHash = await argon2.hash('StrongPassword123');
     usersService = {
       existsByEmail: jest.fn(),
       createUserWithChannel: jest.fn(),
@@ -63,6 +73,10 @@ describe('AuthService (unit)', () => {
     };
     mailService = {
       sendConfirmationEmail: jest.fn(),
+    };
+    refreshTokenRepository = {
+      create: jest.fn(),
+      save: jest.fn(),
     };
     verificationTokenRepository = {
       create: jest.fn(),
@@ -77,6 +91,15 @@ describe('AuthService (unit)', () => {
     };
 
     moduleRef = await Test.createTestingModule({
+      imports: [
+        JwtModule.register({
+          secret: mockAuthConfig.jwtSecret,
+          signOptions: {
+            expiresIn:
+              mockAuthConfig.jwtAccessExpiration as JwtSignOptions['expiresIn'],
+          },
+        }),
+      ],
       providers: [
         AuthService,
         {
@@ -86,6 +109,10 @@ describe('AuthService (unit)', () => {
         {
           provide: MailService,
           useValue: mailService,
+        },
+        {
+          provide: getRepositoryToken(RefreshToken),
+          useValue: refreshTokenRepository,
         },
         {
           provide: getRepositoryToken(VerificationToken),
@@ -103,6 +130,7 @@ describe('AuthService (unit)', () => {
     }).compile();
 
     authService = moduleRef.get(AuthService);
+    jwtService = moduleRef.get(JwtService);
   });
 
   afterAll(async () => {
@@ -115,6 +143,8 @@ describe('AuthService (unit)', () => {
     usersService.findByEmail.mockReset();
     usersService.markEmailConfirmed.mockReset();
     mailService.sendConfirmationEmail.mockReset();
+    refreshTokenRepository.create.mockReset();
+    refreshTokenRepository.save.mockReset();
     verificationTokenRepository.create.mockReset();
     verificationTokenRepository.findOne.mockReset();
     entityManager.save.mockReset();
@@ -123,6 +153,12 @@ describe('AuthService (unit)', () => {
 
     usersService.markEmailConfirmed.mockResolvedValue(undefined);
 
+    refreshTokenRepository.create.mockImplementation((entityLike) =>
+      Object.assign(new RefreshToken(), entityLike),
+    );
+    refreshTokenRepository.save.mockImplementation((entity) =>
+      Promise.resolve(Object.assign(new RefreshToken(), entity)),
+    );
     verificationTokenRepository.create.mockImplementation((entityLike) =>
       Object.assign(new VerificationToken(), entityLike),
     );
@@ -612,6 +648,115 @@ describe('AuthService (unit)', () => {
       ).rejects.toBe(saveError);
 
       expect(mailService.sendConfirmationEmail).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('login', () => {
+    const createUserForLogin = (isConfirmed = true): User =>
+      Object.assign(new User(), {
+        id: 'user-uuid-1',
+        email: 'alice@example.com',
+        password: validPasswordHash,
+        is_confirmed: isConfirmed,
+      });
+
+    it('should normalize email, issue signed access and refresh tokens, and persist hashed refresh token', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+      usersService.findByEmail.mockResolvedValueOnce(createUserForLogin(true));
+
+      const result = await authService.login({
+        email: '  Alice@Example.com  ',
+        password: 'StrongPassword123',
+      });
+
+      expect(usersService.findByEmail).toHaveBeenCalledWith(
+        'alice@example.com',
+      );
+
+      const accessPayload = jwtService.verify<{
+        sub: string;
+        email: string;
+        iat: number;
+        exp: number;
+      }>(result.access_token);
+      expect(accessPayload.sub).toBe('user-uuid-1');
+      expect(accessPayload.email).toBe('alice@example.com');
+      expect(accessPayload.exp - accessPayload.iat).toBe(15 * 60);
+
+      const refreshPayload = jwtService.verify<{
+        sub: string;
+        family: string;
+        jti: string;
+        iat: number;
+        exp: number;
+      }>(result.refresh_token, { secret: mockAuthConfig.jwtRefreshSecret });
+      expect(refreshPayload.sub).toBe('user-uuid-1');
+      expect(refreshPayload.family).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      );
+      expect(refreshPayload.jti).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      );
+      expect(refreshPayload.exp - refreshPayload.iat).toBe(7 * 24 * 60 * 60);
+
+      expect(() =>
+        jwtService.verify<object>(result.refresh_token, {
+          secret: mockAuthConfig.jwtSecret,
+        }),
+      ).toThrow();
+
+      const expectedHash = createHash('sha256')
+        .update(result.refresh_token)
+        .digest('hex');
+
+      expect(refreshTokenRepository.create).toHaveBeenCalledWith({
+        token_hash: expectedHash,
+        family: refreshPayload.family,
+        user_id: 'user-uuid-1',
+        expires_at: new Date(fixedNow + 7 * 24 * 60 * 60 * 1000),
+        revoked_at: null,
+      });
+      expect(refreshTokenRepository.save).toHaveBeenCalledTimes(1);
+    });
+
+    it('should throw InvalidCredentialsException when user is not found', async () => {
+      usersService.findByEmail.mockResolvedValueOnce(null);
+
+      await expect(
+        authService.login({
+          email: 'unknown@example.com',
+          password: 'StrongPassword123',
+        }),
+      ).rejects.toThrow(InvalidCredentialsException);
+
+      expect(refreshTokenRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('should throw InvalidCredentialsException when password does not match even if user is unconfirmed', async () => {
+      usersService.findByEmail.mockResolvedValueOnce(createUserForLogin(false));
+
+      await expect(
+        authService.login({
+          email: 'alice@example.com',
+          password: 'WrongPassword123',
+        }),
+      ).rejects.toThrow(InvalidCredentialsException);
+
+      expect(refreshTokenRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('should throw EmailNotConfirmedException when password matches but user is unconfirmed', async () => {
+      usersService.findByEmail.mockResolvedValueOnce(createUserForLogin(false));
+
+      await expect(
+        authService.login({
+          email: 'alice@example.com',
+          password: 'StrongPassword123',
+        }),
+      ).rejects.toThrow(EmailNotConfirmedException);
+
+      expect(refreshTokenRepository.save).not.toHaveBeenCalled();
     });
   });
 });
