@@ -1,10 +1,17 @@
-import { INestApplication, ValidationPipe } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  INestApplication,
+  ValidationPipe,
+} from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { Test, TestingModule } from '@nestjs/testing';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../src/app.module';
+import type { JwtPayload } from '../src/auth/auth.types';
+import { CurrentUser } from '../src/auth/decorators/current-user.decorator';
 import { RefreshToken } from '../src/auth/entities/refresh-token.entity';
 import { VerificationToken } from '../src/auth/entities/verification-token.entity';
 import { DomainExceptionFilter } from '../src/common/filters/domain-exception.filter';
@@ -46,6 +53,17 @@ interface MailpitMessageDetail {
   HTML: string;
 }
 
+@Controller('test-protected')
+class TestProtectedController {
+  @Get('me')
+  getMe(
+    @CurrentUser() user: JwtPayload,
+    @CurrentUser('sub') userId: string,
+  ): { user: JwtPayload; userId: string } {
+    return { user, userId };
+  }
+}
+
 describe('AuthController (e2e)', () => {
   jest.setTimeout(15000);
 
@@ -56,6 +74,7 @@ describe('AuthController (e2e)', () => {
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
+      controllers: [TestProtectedController],
     }).compile();
 
     app = moduleFixture.createNestApplication();
@@ -650,6 +669,136 @@ describe('AuthController (e2e)', () => {
           'password must be a string',
         ]),
       );
+    });
+  });
+
+  describe('JWT Access Token Guard & @Public()', () => {
+    const registerConfirmAndLogin = async (
+      email: string,
+    ): Promise<{
+      userId: string;
+      access_token: string;
+      refresh_token: string;
+    }> => {
+      const { userId, token } = await registerAndGetToken(email);
+      await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({ token })
+        .expect(204);
+
+      const loginResponse = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email,
+          password: 'StrongPassword123',
+        })
+        .expect(200);
+
+      const tokens = loginResponse.body as LoginResponseBody;
+      return {
+        userId,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+      };
+    };
+
+    it('should return 401 on protected endpoint when Authorization header is missing', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/test-protected/me')
+        .expect(401);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body.statusCode).toBe(401);
+      expect(body.error).toBe('Unauthorized');
+      expect(typeof body.message).toBe('string');
+      expect((body.message as string).length).toBeGreaterThan(0);
+    });
+
+    it('should return 401 on protected endpoint when Bearer token is malformed or signed with refresh secret', async () => {
+      const { refresh_token } = await registerConfirmAndLogin(
+        'guard-invalid@example.com',
+      );
+
+      const malformedRes = await request(app.getHttpServer())
+        .get('/test-protected/me')
+        .set('Authorization', 'Bearer malformed-token')
+        .expect(401);
+
+      const malformedBody = malformedRes.body as ErrorResponseBody;
+      expect(malformedBody.statusCode).toBe(401);
+      expect(malformedBody.error).toBe('Unauthorized');
+      expect(typeof malformedBody.message).toBe('string');
+
+      const refreshSecretRes = await request(app.getHttpServer())
+        .get('/test-protected/me')
+        .set('Authorization', `Bearer ${refresh_token}`)
+        .expect(401);
+
+      const refreshSecretBody = refreshSecretRes.body as ErrorResponseBody;
+      expect(refreshSecretBody.statusCode).toBe(401);
+      expect(refreshSecretBody.error).toBe('Unauthorized');
+      expect(typeof refreshSecretBody.message).toBe('string');
+    });
+
+    it('should return 401 on protected endpoint when Bearer JWT is expired', async () => {
+      const { userId } = await registerConfirmAndLogin(
+        'guard-expired@example.com',
+      );
+      const expiredToken = jwtService.sign(
+        { sub: userId, email: 'guard-expired@example.com' },
+        { expiresIn: '-1s' },
+      );
+
+      const response = await request(app.getHttpServer())
+        .get('/test-protected/me')
+        .set('Authorization', `Bearer ${expiredToken}`)
+        .expect(401);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body.statusCode).toBe(401);
+      expect(body.error).toBe('Unauthorized');
+      expect(typeof body.message).toBe('string');
+    });
+
+    it('should return 200 with authenticated user payload on protected endpoint when access_token is valid', async () => {
+      const { userId, access_token } = await registerConfirmAndLogin(
+        'guard-valid@example.com',
+      );
+
+      const response = await request(app.getHttpServer())
+        .get('/test-protected/me')
+        .set('Authorization', `Bearer ${access_token}`)
+        .expect(200);
+
+      expect(response.body).toEqual({
+        user: expect.objectContaining({
+          sub: userId,
+          email: 'guard-valid@example.com',
+        }) as JwtPayload,
+        userId,
+      });
+    });
+
+    it('should allow unauthenticated access to @Public() routes even with a stale Authorization header', async () => {
+      await request(app.getHttpServer())
+        .get('/')
+        .expect(200)
+        .expect('Hello World!');
+
+      await request(app.getHttpServer())
+        .get('/')
+        .set('Authorization', 'Bearer stale-token')
+        .expect(200)
+        .expect('Hello World!');
+
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .set('Authorization', 'Bearer stale-token')
+        .send({
+          email: 'guard-public-register@example.com',
+          password: 'StrongPassword123',
+        })
+        .expect(201);
     });
   });
 });

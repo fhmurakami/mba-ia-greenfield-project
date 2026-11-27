@@ -1,7 +1,7 @@
 # Phase 02 — Cadastro, Login e Gerenciamento de Conta — Progress
 
 **Status:** in_progress
-**SIs:** 8/13 completed
+**SIs:** 9/13 completed
 
 ### SI-02.1 — Dependencies, Configuration Namespaces, and Docker Compose
 
@@ -53,9 +53,9 @@
 
 ### SI-02.9 — JWT Access Token Guard
 
-- **Status:** pending
-- **Tests:** pending
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 2 suites passed (41 tests)
+- **Observations:** Implemented `@Public()` (`IS_PUBLIC_KEY`), `@CurrentUser()` (with `JwtPayload`), and `JwtAuthGuard` registered globally via `APP_GUARD` in `AuthModule` so all routes require a valid Bearer access token by default. Extracted shared `JwtPayload` / `AuthenticatedRequest` types into `src/auth/auth.types.ts` and `IS_PUBLIC_KEY` / `BEARER_SCHEME` into `src/auth/auth.constants.ts`, supporting case-insensitive `Bearer` scheme matching per RFC 9110. Decorated `AppController.getHello()` and the existing public routes in `AuthController` (`register`, `confirm-email`, `resend-confirmation`, `login`) individually with `@Public()`. Verified in `jwt-auth.guard.spec.ts` using real `JwtModule.register(...)` and in `test/auth.e2e-spec.ts` using a test-only `TestProtectedController` (`GET /test-protected/me`), asserting `{ statusCode: 401, error: 'Unauthorized', message }` rejections and `@Public()` access even with a stale `Authorization` header. Context7 verification: `@nestjs/jwt@^11.0.2` exact `11.0.2` docs (`jwtService.verifyAsync<JwtPayload>`), `@nestjs/common@^11.0.1` / `@nestjs/core@^11.0.1` served current NestJS 11 docs (`CanActivate`, `Reflector.getAllAndOverride`, `SetMetadata`, `createParamDecorator`, `APP_GUARD`).
 
 ### SI-02.10 — Refresh Token Rotation
 
@@ -86,3 +86,7 @@
 - [ ] Extract duplicated global pipes/filters configuration between `src/main.ts` and `test/auth.e2e-spec.ts` into a shared bootstrap helper (per `testing-guide-nestjs-project/references/gotchas.md` §2).
 - [ ] Type `jwtAccessExpiration` and `jwtRefreshExpiration` as `JwtSignOptions['expiresIn']` in `src/config/auth.config.ts` and validate duration format (e.g., `/^\d+[smhd]$/`) in `src/config/env.validation.ts` so invalid expiration strings fail at startup and redundant type assertions in `AuthModule`/`AuthService` are removed.
 - [ ] Extract duplicated email normalization (`email.trim().toLowerCase()`) between `UsersService` and `AuthService` into a shared utility helper.
+- [ ] Adopt `JwtPayload` (and a typed `RefreshTokenPayload`) from `src/auth/auth.types.ts` in `AuthService` token signing/decoding and login E2E assertions so JWT payload contracts share a single source of truth.
+- [ ] Evaluate whether an authenticated session-inspection endpoint (e.g., `GET /auth/me` as in reference commit `c927802`, or `GET /users/me` in Phase 03) should be formally added to the API contract with an explicit rate-limit policy.
+- [ ] Hoist and deduplicate shared E2E auth setup helpers (`registerAndConfirmUser` / `registerConfirmAndLogin`, keeping real Mailpit token extraction) across `describe` blocks in `test/auth.e2e-spec.ts`.
+- [ ] Evaluate a global `HttpException` filter to normalize framework error codes (e.g., `UnauthorizedException` -> `UNAUTHORIZED`, `ThrottlerException` -> `TOO_MANY_REQUESTS`) to `UPPER_SNAKE_CASE` alongside `DomainExceptionFilter` and `ValidationExceptionFilter`.
