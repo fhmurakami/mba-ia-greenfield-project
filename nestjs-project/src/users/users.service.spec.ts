@@ -6,6 +6,7 @@ import {
   QueryFailedError,
   Repository,
   SelectQueryBuilder,
+  UpdateResult,
 } from 'typeorm';
 import { EmailAlreadyExistsException } from '../common/exceptions/domain.exception';
 import { Channel } from './entities/channel.entity';
@@ -31,7 +32,10 @@ describe('UsersService (unit)', () => {
   let moduleRef: TestingModule;
   let usersService: UsersService;
   let userRepository: jest.Mocked<
-    Pick<Repository<User>, 'create' | 'existsBy' | 'createQueryBuilder'>
+    Pick<
+      Repository<User>,
+      'create' | 'existsBy' | 'createQueryBuilder' | 'update'
+    >
   >;
   let queryBuilder: jest.Mocked<
     Pick<
@@ -41,7 +45,9 @@ describe('UsersService (unit)', () => {
   >;
   let channelRepository: jest.Mocked<Pick<Repository<Channel>, 'create'>>;
   let dataSource: jest.Mocked<Pick<DataSource, 'transaction'>>;
-  let txManager: jest.Mocked<Pick<EntityManager, 'save' | 'transaction'>>;
+  let txManager: jest.Mocked<
+    Pick<EntityManager, 'save' | 'transaction' | 'update'>
+  >;
   let subManager: jest.Mocked<Pick<EntityManager, 'save'>>;
 
   beforeAll(async () => {
@@ -55,6 +61,7 @@ describe('UsersService (unit)', () => {
       create: jest.fn(),
       existsBy: jest.fn(),
       createQueryBuilder: jest.fn(),
+      update: jest.fn(),
     };
     channelRepository = {
       create: jest.fn(),
@@ -65,6 +72,7 @@ describe('UsersService (unit)', () => {
     txManager = {
       save: jest.fn(),
       transaction: jest.fn(),
+      update: jest.fn(),
     };
     subManager = {
       save: jest.fn(),
@@ -99,6 +107,7 @@ describe('UsersService (unit)', () => {
     userRepository.create.mockReset();
     userRepository.existsBy.mockReset();
     userRepository.createQueryBuilder.mockReset();
+    userRepository.update.mockReset();
     queryBuilder.addSelect.mockReset();
     queryBuilder.leftJoinAndSelect.mockReset();
     queryBuilder.where.mockReset();
@@ -107,7 +116,16 @@ describe('UsersService (unit)', () => {
     dataSource.transaction.mockReset();
     txManager.save.mockReset();
     txManager.transaction.mockReset();
+    txManager.update.mockReset();
     subManager.save.mockReset();
+
+    const defaultUpdateResult: UpdateResult = {
+      affected: 1,
+      raw: [],
+      generatedMaps: [],
+    };
+    userRepository.update.mockResolvedValue(defaultUpdateResult);
+    txManager.update.mockResolvedValue(defaultUpdateResult);
 
     userRepository.createQueryBuilder.mockReturnValue(
       queryBuilder as unknown as SelectQueryBuilder<User>,
@@ -368,6 +386,32 @@ describe('UsersService (unit)', () => {
       expect(queryBuilder.where).toHaveBeenCalledWith('user.email = :email', {
         email: 'alice@example.com',
       });
+    });
+  });
+
+  describe('markEmailConfirmed', () => {
+    it('should update user via userRepository when manager is omitted', async () => {
+      await usersService.markEmailConfirmed('user-uuid-1');
+
+      expect(userRepository.update).toHaveBeenCalledWith(
+        { id: 'user-uuid-1' },
+        { is_confirmed: true },
+      );
+      expect(txManager.update).not.toHaveBeenCalled();
+    });
+
+    it('should update user via provided EntityManager when manager is passed', async () => {
+      await usersService.markEmailConfirmed(
+        'user-uuid-1',
+        txManager as unknown as EntityManager,
+      );
+
+      expect(txManager.update).toHaveBeenCalledWith(
+        User,
+        { id: 'user-uuid-1' },
+        { is_confirmed: true },
+      );
+      expect(userRepository.update).not.toHaveBeenCalled();
     });
   });
 });

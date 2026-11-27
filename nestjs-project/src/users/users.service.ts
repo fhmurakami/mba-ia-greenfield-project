@@ -132,4 +132,13 @@ export class UsersService {
       .where('user.email = :email', { email: normalizedEmail })
       .getOne();
   }
+
+  async markEmailConfirmed(
+    userId: string,
+    manager?: EntityManager,
+  ): Promise<void> {
+    await (manager
+      ? manager.update(User, { id: userId }, { is_confirmed: true })
+      : this.userRepository.update({ id: userId }, { is_confirmed: true }));
+  }
 }

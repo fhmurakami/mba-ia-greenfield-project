@@ -4,10 +4,12 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../src/app.module';
+import { VerificationToken } from '../src/auth/entities/verification-token.entity';
 import { DomainExceptionFilter } from '../src/common/filters/domain-exception.filter';
 import { ValidationExceptionFilter } from '../src/common/filters/validation-exception.filter';
 import { MAIL_SUBJECTS } from '../src/mail/mail.constants';
 import { Channel } from '../src/users/entities/channel.entity';
+import { User } from '../src/users/entities/user.entity';
 import { clearTestTables } from './create-test-data-source';
 import {
   clearMailpitMessages,
@@ -73,6 +75,36 @@ describe('AuthController (e2e)', () => {
     await clearTestTables(dataSource);
     await clearMailpitMessages();
   });
+
+  const extractConfirmationToken = async (): Promise<string> => {
+    const messages = (await getMailpitMessages()) as MailpitMessageSummary[];
+    expect(messages.length).toBeGreaterThan(0);
+
+    const detail = (await getMailpitMessage(
+      messages[0].ID,
+    )) as MailpitMessageDetail;
+    const match = /\/auth\/confirm-email\?token=([a-f0-9]{64})/.exec(
+      detail.HTML,
+    );
+    expect(match).not.toBeNull();
+    return match![1];
+  };
+
+  const registerAndGetToken = async (
+    email: string,
+  ): Promise<{ userId: string; token: string }> => {
+    const response = await request(app.getHttpServer())
+      .post('/auth/register')
+      .send({
+        email,
+        password: 'StrongPassword123',
+      })
+      .expect(201);
+
+    const body = response.body as RegisterResponseBody;
+    const token = await extractConfirmationToken();
+    return { userId: body.id, token };
+  };
 
   describe('POST /auth/register', () => {
     it('should return 201 with user id and normalized email without exposing password', async () => {
@@ -292,6 +324,185 @@ describe('AuthController (e2e)', () => {
           expect.arrayContaining(['property unknownField should not exist']),
         );
       });
+    });
+  });
+
+  describe('POST /auth/confirm-email', () => {
+    it('should return 204 with empty body and mark user as confirmed', async () => {
+      const { userId, token } = await registerAndGetToken(
+        'confirm-e2e@example.com',
+      );
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({ token })
+        .expect(204);
+
+      expect(response.text).toBe('');
+
+      const user = await dataSource.getRepository(User).findOneBy({
+        id: userId,
+      });
+      expect(user?.is_confirmed).toBe(true);
+    });
+
+    it('should return 401 INVALID_TOKEN when token does not exist', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({ token: '0'.repeat(64) })
+        .expect(401);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body).toEqual({
+        statusCode: 401,
+        error: 'INVALID_TOKEN',
+        message: 'Invalid or already used token',
+      });
+    });
+
+    it('should return 401 INVALID_TOKEN when token has already been used', async () => {
+      const { token } = await registerAndGetToken('used-e2e@example.com');
+
+      await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({ token })
+        .expect(204);
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({ token })
+        .expect(401);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body).toEqual({
+        statusCode: 401,
+        error: 'INVALID_TOKEN',
+        message: 'Invalid or already used token',
+      });
+    });
+
+    it('should return 401 TOKEN_EXPIRED when token is expired', async () => {
+      const { userId, token } = await registerAndGetToken(
+        'expired-e2e@example.com',
+      );
+
+      await dataSource
+        .getRepository(VerificationToken)
+        .update(
+          { user_id: userId },
+          { expires_at: new Date(Date.now() - 60_000) },
+        );
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({ token })
+        .expect(401);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body).toEqual({
+        statusCode: 401,
+        error: 'TOKEN_EXPIRED',
+        message: 'Token has expired',
+      });
+    });
+
+    it('should return 400 VALIDATION_ERROR when token is missing or empty', async () => {
+      const emptyResponse = await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({ token: '' })
+        .expect(400);
+
+      const emptyBody = emptyResponse.body as ErrorResponseBody;
+      expect(emptyBody.statusCode).toBe(400);
+      expect(emptyBody.error).toBe('VALIDATION_ERROR');
+      expect(emptyBody.message).toEqual(
+        expect.arrayContaining(['token should not be empty']),
+      );
+
+      const missingResponse = await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({})
+        .expect(400);
+
+      const missingBody = missingResponse.body as ErrorResponseBody;
+      expect(missingBody.statusCode).toBe(400);
+      expect(missingBody.error).toBe('VALIDATION_ERROR');
+      expect(missingBody.message).toEqual(
+        expect.arrayContaining([
+          'token should not be empty',
+          'token must be a string',
+        ]),
+      );
+    });
+  });
+
+  describe('POST /auth/resend-confirmation', () => {
+    it('should return 204, invalidate old token, and deliver new confirmation email', async () => {
+      const { token: oldToken } = await registerAndGetToken(
+        'resend-e2e@example.com',
+      );
+      await clearMailpitMessages();
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/resend-confirmation')
+        .send({ email: 'resend-e2e@example.com' })
+        .expect(204);
+
+      expect(response.text).toBe('');
+
+      const newToken = await extractConfirmationToken();
+      expect(newToken).not.toBe(oldToken);
+
+      await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({ token: oldToken })
+        .expect(401);
+
+      await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({ token: newToken })
+        .expect(204);
+    });
+
+    it('should return 204 without sending email when email is not registered', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/resend-confirmation')
+        .send({ email: 'unknown-e2e@example.com' })
+        .expect(204);
+
+      expect(response.text).toBe('');
+      expect(await getMailpitMessages()).toHaveLength(0);
+    });
+
+    it('should return 204 without sending email when user is already confirmed', async () => {
+      const { token } = await registerAndGetToken('confirmed-e2e@example.com');
+      await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({ token })
+        .expect(204);
+      await clearMailpitMessages();
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/resend-confirmation')
+        .send({ email: 'confirmed-e2e@example.com' })
+        .expect(204);
+
+      expect(response.text).toBe('');
+      expect(await getMailpitMessages()).toHaveLength(0);
+    });
+
+    it('should return 400 VALIDATION_ERROR when email format is invalid', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/resend-confirmation')
+        .send({ email: 'not-an-email' })
+        .expect(400);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body.statusCode).toBe(400);
+      expect(body.error).toBe('VALIDATION_ERROR');
+      expect(body.message).toEqual(
+        expect.arrayContaining(['email must be an email']),
+      );
     });
   });
 });

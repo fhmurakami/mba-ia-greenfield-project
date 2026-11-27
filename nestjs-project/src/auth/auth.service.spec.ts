@@ -3,8 +3,18 @@ import * as argon2 from 'argon2';
 import type { ConfigType } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { DataSource, EntityManager, Repository } from 'typeorm';
-import { EmailAlreadyExistsException } from '../common/exceptions/domain.exception';
+import {
+  DataSource,
+  EntityManager,
+  IsNull,
+  Repository,
+  UpdateResult,
+} from 'typeorm';
+import {
+  EmailAlreadyExistsException,
+  InvalidTokenException,
+  TokenExpiredException,
+} from '../common/exceptions/domain.exception';
 import authConfig from '../config/auth.config';
 import { MailService } from '../mail/mail.service';
 import { Channel } from '../users/entities/channel.entity';
@@ -29,28 +39,38 @@ describe('AuthService (unit)', () => {
   let moduleRef: TestingModule;
   let authService: AuthService;
   let usersService: jest.Mocked<
-    Pick<UsersService, 'existsByEmail' | 'createUserWithChannel'>
+    Pick<
+      UsersService,
+      | 'existsByEmail'
+      | 'createUserWithChannel'
+      | 'findByEmail'
+      | 'markEmailConfirmed'
+    >
   >;
   let mailService: jest.Mocked<Pick<MailService, 'sendConfirmationEmail'>>;
   let verificationTokenRepository: jest.Mocked<
-    Pick<Repository<VerificationToken>, 'create'>
+    Pick<Repository<VerificationToken>, 'create' | 'findOne'>
   >;
-  let entityManager: jest.Mocked<Pick<EntityManager, 'save'>>;
+  let entityManager: jest.Mocked<Pick<EntityManager, 'save' | 'update'>>;
   let dataSource: jest.Mocked<Pick<DataSource, 'transaction'>>;
 
   beforeAll(async () => {
     usersService = {
       existsByEmail: jest.fn(),
       createUserWithChannel: jest.fn(),
+      findByEmail: jest.fn(),
+      markEmailConfirmed: jest.fn(),
     };
     mailService = {
       sendConfirmationEmail: jest.fn(),
     };
     verificationTokenRepository = {
       create: jest.fn(),
+      findOne: jest.fn(),
     };
     entityManager = {
       save: jest.fn(),
+      update: jest.fn(),
     };
     dataSource = {
       transaction: jest.fn(),
@@ -92,10 +112,16 @@ describe('AuthService (unit)', () => {
   beforeEach(() => {
     usersService.existsByEmail.mockReset();
     usersService.createUserWithChannel.mockReset();
+    usersService.findByEmail.mockReset();
+    usersService.markEmailConfirmed.mockReset();
     mailService.sendConfirmationEmail.mockReset();
     verificationTokenRepository.create.mockReset();
+    verificationTokenRepository.findOne.mockReset();
     entityManager.save.mockReset();
+    entityManager.update.mockReset();
     dataSource.transaction.mockReset();
+
+    usersService.markEmailConfirmed.mockResolvedValue(undefined);
 
     verificationTokenRepository.create.mockImplementation((entityLike) =>
       Object.assign(new VerificationToken(), entityLike),
@@ -104,6 +130,11 @@ describe('AuthService (unit)', () => {
       (_targetOrEntity: unknown, entity?: unknown) =>
         Promise.resolve(Object.assign(new VerificationToken(), entity)),
     );
+    entityManager.update.mockResolvedValue({
+      affected: 1,
+      raw: [],
+      generatedMaps: [],
+    } satisfies UpdateResult);
     dataSource.transaction.mockImplementation(
       (
         isolationOrCb: string | ((manager: EntityManager) => Promise<unknown>),
@@ -327,6 +358,258 @@ describe('AuthService (unit)', () => {
           password: 'StrongPassword123',
         }),
       ).rejects.toBe(tokenSaveError);
+
+      expect(mailService.sendConfirmationEmail).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('confirm', () => {
+    const rawToken = 'a'.repeat(64);
+    const expectedHash = createHash('sha256').update(rawToken).digest('hex');
+
+    it('should mark verification token as used and confirm user inside transaction', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const tokenRecord = Object.assign(new VerificationToken(), {
+        id: 'token-uuid-1',
+        token_hash: expectedHash,
+        type: VerificationTokenType.EMAIL_CONFIRMATION,
+        user_id: 'user-uuid-1',
+        expires_at: new Date(fixedNow + 60_000),
+        used_at: null,
+      });
+      verificationTokenRepository.findOne.mockResolvedValueOnce(tokenRecord);
+
+      await authService.confirm(rawToken);
+
+      expect(verificationTokenRepository.findOne).toHaveBeenCalledWith({
+        where: {
+          token_hash: expectedHash,
+          type: VerificationTokenType.EMAIL_CONFIRMATION,
+        },
+      });
+      expect(dataSource.transaction).toHaveBeenCalledTimes(1);
+      expect(entityManager.update).toHaveBeenCalledTimes(1);
+      expect(entityManager.update).toHaveBeenCalledWith(
+        VerificationToken,
+        { id: 'token-uuid-1', used_at: IsNull() },
+        { used_at: new Date(fixedNow) },
+      );
+      expect(usersService.markEmailConfirmed).toHaveBeenCalledTimes(1);
+      expect(usersService.markEmailConfirmed).toHaveBeenCalledWith(
+        'user-uuid-1',
+        entityManager,
+      );
+    });
+
+    it('should throw InvalidTokenException when token is not found', async () => {
+      verificationTokenRepository.findOne.mockResolvedValueOnce(null);
+
+      await expect(authService.confirm(rawToken)).rejects.toThrow(
+        InvalidTokenException,
+      );
+
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+      expect(usersService.markEmailConfirmed).not.toHaveBeenCalled();
+    });
+
+    it('should throw InvalidTokenException when token was already used even if also expired', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const usedToken = Object.assign(new VerificationToken(), {
+        id: 'token-uuid-1',
+        token_hash: expectedHash,
+        type: VerificationTokenType.EMAIL_CONFIRMATION,
+        user_id: 'user-uuid-1',
+        expires_at: new Date(fixedNow - 60_000),
+        used_at: new Date(fixedNow - 120_000),
+      });
+      verificationTokenRepository.findOne.mockResolvedValueOnce(usedToken);
+
+      await expect(authService.confirm(rawToken)).rejects.toThrow(
+        InvalidTokenException,
+      );
+
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+      expect(usersService.markEmailConfirmed).not.toHaveBeenCalled();
+    });
+
+    it('should throw TokenExpiredException when unused token is expired at boundary', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const expiredToken = Object.assign(new VerificationToken(), {
+        id: 'token-uuid-1',
+        token_hash: expectedHash,
+        type: VerificationTokenType.EMAIL_CONFIRMATION,
+        user_id: 'user-uuid-1',
+        expires_at: new Date(fixedNow),
+        used_at: null,
+      });
+      verificationTokenRepository.findOne.mockResolvedValueOnce(expiredToken);
+
+      await expect(authService.confirm(rawToken)).rejects.toThrow(
+        TokenExpiredException,
+      );
+
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+      expect(usersService.markEmailConfirmed).not.toHaveBeenCalled();
+    });
+
+    it('should throw InvalidTokenException on concurrent consumption without updating user', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const tokenRecord = Object.assign(new VerificationToken(), {
+        id: 'token-uuid-1',
+        token_hash: expectedHash,
+        type: VerificationTokenType.EMAIL_CONFIRMATION,
+        user_id: 'user-uuid-1',
+        expires_at: new Date(fixedNow + 60_000),
+        used_at: null,
+      });
+      verificationTokenRepository.findOne.mockResolvedValueOnce(tokenRecord);
+      entityManager.update.mockResolvedValueOnce({
+        affected: 0,
+        raw: [],
+        generatedMaps: [],
+      } satisfies UpdateResult);
+
+      await expect(authService.confirm(rawToken)).rejects.toThrow(
+        InvalidTokenException,
+      );
+
+      expect(entityManager.update).toHaveBeenCalledTimes(1);
+      expect(usersService.markEmailConfirmed).not.toHaveBeenCalled();
+    });
+
+    it('should propagate error when markEmailConfirmed fails inside transaction', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const tokenRecord = Object.assign(new VerificationToken(), {
+        id: 'token-uuid-1',
+        token_hash: expectedHash,
+        type: VerificationTokenType.EMAIL_CONFIRMATION,
+        user_id: 'user-uuid-1',
+        expires_at: new Date(fixedNow + 60_000),
+        used_at: null,
+      });
+      verificationTokenRepository.findOne.mockResolvedValueOnce(tokenRecord);
+      const confirmError = new Error('User confirmation update failed');
+      usersService.markEmailConfirmed.mockRejectedValueOnce(confirmError);
+
+      await expect(authService.confirm(rawToken)).rejects.toBe(confirmError);
+    });
+  });
+
+  describe('resendConfirmation', () => {
+    const createUnconfirmedUser = (): User =>
+      Object.assign(new User(), {
+        id: 'user-uuid-1',
+        email: 'alice@example.com',
+        is_confirmed: false,
+        channel: Object.assign(new Channel(), {
+          id: 'channel-uuid-1',
+          name: 'alice',
+          nickname: 'alice',
+        }),
+      });
+
+    it('should invalidate unused confirmation tokens, create new token, and send confirmation email', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      usersService.findByEmail.mockResolvedValueOnce(createUnconfirmedUser());
+      mailService.sendConfirmationEmail.mockResolvedValueOnce(undefined);
+
+      await authService.resendConfirmation('  Alice@Example.com  ');
+
+      expect(usersService.findByEmail).toHaveBeenCalledWith(
+        'alice@example.com',
+      );
+      expect(dataSource.transaction).toHaveBeenCalledTimes(1);
+      expect(entityManager.update).toHaveBeenCalledWith(
+        VerificationToken,
+        {
+          user_id: 'user-uuid-1',
+          type: VerificationTokenType.EMAIL_CONFIRMATION,
+          used_at: IsNull(),
+        },
+        { used_at: new Date(fixedNow) },
+      );
+
+      expect(mailService.sendConfirmationEmail).toHaveBeenCalledTimes(1);
+      const [mailTo, mailName, rawToken] =
+        mailService.sendConfirmationEmail.mock.calls[0];
+      expect(mailTo).toBe('alice@example.com');
+      expect(mailName).toBe('alice');
+      expect(rawToken).toMatch(/^[a-f0-9]{64}$/);
+
+      expect(verificationTokenRepository.create).toHaveBeenCalledTimes(1);
+      const createResult = verificationTokenRepository.create.mock.results[0];
+      if (createResult.type !== 'return') {
+        throw new Error(
+          'Expected verificationTokenRepository.create to return',
+        );
+      }
+      const createdToken = createResult.value;
+
+      expect(entityManager.save).toHaveBeenCalledWith(
+        VerificationToken,
+        createdToken,
+      );
+      expect(createdToken.token_hash).toBe(
+        createHash('sha256').update(rawToken).digest('hex'),
+      );
+      expect(createdToken.type).toBe(VerificationTokenType.EMAIL_CONFIRMATION);
+      expect(createdToken.user_id).toBe('user-uuid-1');
+      expect(createdToken.used_at).toBeNull();
+      expect(createdToken.expires_at).toEqual(
+        new Date(
+          fixedNow +
+            mockAuthConfig.confirmationTokenExpirationHours * 60 * 60 * 1000,
+        ),
+      );
+    });
+
+    it('should return silently when email is not found', async () => {
+      usersService.findByEmail.mockResolvedValueOnce(null);
+
+      await expect(
+        authService.resendConfirmation('unknown@example.com'),
+      ).resolves.toBeUndefined();
+
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+      expect(entityManager.save).not.toHaveBeenCalled();
+      expect(mailService.sendConfirmationEmail).not.toHaveBeenCalled();
+    });
+
+    it('should return silently when user is already confirmed', async () => {
+      const confirmedUser = Object.assign(createUnconfirmedUser(), {
+        is_confirmed: true,
+      });
+      usersService.findByEmail.mockResolvedValueOnce(confirmedUser);
+
+      await expect(
+        authService.resendConfirmation('alice@example.com'),
+      ).resolves.toBeUndefined();
+
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+      expect(entityManager.save).not.toHaveBeenCalled();
+      expect(mailService.sendConfirmationEmail).not.toHaveBeenCalled();
+    });
+
+    it('should propagate error when saving new token fails and not send email', async () => {
+      usersService.findByEmail.mockResolvedValueOnce(createUnconfirmedUser());
+      const saveError = new Error('Token save failed');
+      entityManager.save.mockRejectedValueOnce(saveError);
+
+      await expect(
+        authService.resendConfirmation('alice@example.com'),
+      ).rejects.toBe(saveError);
 
       expect(mailService.sendConfirmationEmail).not.toHaveBeenCalled();
     });

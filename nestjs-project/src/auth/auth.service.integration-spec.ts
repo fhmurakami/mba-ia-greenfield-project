@@ -13,7 +13,11 @@ import {
   getMailpitMessage,
   getMailpitMessages,
 } from '../../test/mailpit';
-import { EmailAlreadyExistsException } from '../common/exceptions/domain.exception';
+import {
+  EmailAlreadyExistsException,
+  InvalidTokenException,
+  TokenExpiredException,
+} from '../common/exceptions/domain.exception';
 import appConfig from '../config/app.config';
 import authConfig from '../config/auth.config';
 import databaseConfig from '../config/database.config';
@@ -21,6 +25,7 @@ import mailConfig from '../config/mail.config';
 import { MAIL_SUBJECTS } from '../mail/mail.constants';
 import { Channel } from '../users/entities/channel.entity';
 import { User } from '../users/entities/user.entity';
+import { UsersService } from '../users/users.service';
 import { AuthModule } from './auth.module';
 import { AuthService } from './auth.service';
 import { RefreshToken } from './entities/refresh-token.entity';
@@ -45,6 +50,7 @@ describe('AuthService (integration)', () => {
 
   let moduleRef: TestingModule;
   let authService: AuthService;
+  let usersService: UsersService;
   let dataSource: DataSource;
   let verificationTokenRepository: Repository<VerificationToken>;
 
@@ -68,6 +74,7 @@ describe('AuthService (integration)', () => {
     }).compile();
 
     authService = moduleRef.get(AuthService);
+    usersService = moduleRef.get(UsersService);
     dataSource = moduleRef.get(DataSource);
     verificationTokenRepository = moduleRef.get<Repository<VerificationToken>>(
       getRepositoryToken(VerificationToken),
@@ -86,6 +93,20 @@ describe('AuthService (integration)', () => {
   afterEach(() => {
     jest.restoreAllMocks();
   });
+
+  const extractConfirmationTokenFromLatestEmail = async (): Promise<string> => {
+    const messages = (await getMailpitMessages()) as MailpitMessageSummary[];
+    expect(messages.length).toBeGreaterThan(0);
+
+    const detail = (await getMailpitMessage(
+      messages[0].ID,
+    )) as MailpitMessageDetail;
+    const match = /\/auth\/confirm-email\?token=([a-f0-9]{64})/.exec(
+      detail.HTML,
+    );
+    expect(match).not.toBeNull();
+    return match![1];
+  };
 
   describe('register', () => {
     it('should persist unconfirmed user with Argon2 password hash and sanitized channel', async () => {
@@ -233,6 +254,204 @@ describe('AuthService (integration)', () => {
       expect(await dataSource.getRepository(User).count()).toBe(0);
       expect(await dataSource.getRepository(Channel).count()).toBe(0);
       expect(await verificationTokenRepository.count()).toBe(0);
+      expect(await getMailpitMessages()).toHaveLength(0);
+    });
+  });
+
+  describe('confirm', () => {
+    it('should confirm user and mark verification token as used in database', async () => {
+      const registered = await authService.register({
+        email: 'confirm@example.com',
+        password: 'MySecretPassword123',
+      });
+      const rawToken = await extractConfirmationTokenFromLatestEmail();
+
+      await authService.confirm(rawToken);
+
+      const user = await dataSource
+        .getRepository(User)
+        .findOneBy({ id: registered.id });
+      const tokens = await verificationTokenRepository.find({
+        where: { user_id: registered.id },
+      });
+
+      expect(user?.is_confirmed).toBe(true);
+      expect(tokens).toHaveLength(1);
+      expect(tokens[0].used_at).toBeInstanceOf(Date);
+    });
+
+    it('should throw InvalidTokenException when reusing an already-consumed confirmation token', async () => {
+      await authService.register({
+        email: 'reuse@example.com',
+        password: 'MySecretPassword123',
+      });
+      const rawToken = await extractConfirmationTokenFromLatestEmail();
+
+      await authService.confirm(rawToken);
+
+      await expect(authService.confirm(rawToken)).rejects.toThrow(
+        InvalidTokenException,
+      );
+    });
+
+    it('should throw TokenExpiredException when token is expired and keep user unconfirmed', async () => {
+      const registered = await authService.register({
+        email: 'expired@example.com',
+        password: 'MySecretPassword123',
+      });
+      const rawToken = await extractConfirmationTokenFromLatestEmail();
+
+      await verificationTokenRepository.update(
+        { user_id: registered.id },
+        { expires_at: new Date(Date.now() - 60_000) },
+      );
+
+      await expect(authService.confirm(rawToken)).rejects.toThrow(
+        TokenExpiredException,
+      );
+
+      const user = await dataSource
+        .getRepository(User)
+        .findOneBy({ id: registered.id });
+      const token = await verificationTokenRepository.findOneBy({
+        user_id: registered.id,
+      });
+      expect(user?.is_confirmed).toBe(false);
+      expect(token?.used_at).toBeNull();
+    });
+
+    it('should throw InvalidTokenException if a password_reset token is passed to confirm', async () => {
+      const registered = await authService.register({
+        email: 'reset-type@example.com',
+        password: 'MySecretPassword123',
+      });
+      const rawResetToken = 'b'.repeat(64);
+      const resetHash = createHash('sha256')
+        .update(rawResetToken)
+        .digest('hex');
+
+      await verificationTokenRepository.save(
+        verificationTokenRepository.create({
+          token_hash: resetHash,
+          type: VerificationTokenType.PASSWORD_RESET,
+          user_id: registered.id,
+          expires_at: new Date(Date.now() + 60_000),
+          used_at: null,
+        }),
+      );
+
+      await expect(authService.confirm(rawResetToken)).rejects.toThrow(
+        InvalidTokenException,
+      );
+    });
+
+    it('should roll back verification token used_at when markEmailConfirmed fails inside transaction', async () => {
+      const registered = await authService.register({
+        email: 'confirm-tx-rollback@example.com',
+        password: 'MySecretPassword123',
+      });
+      const rawToken = await extractConfirmationTokenFromLatestEmail();
+
+      jest
+        .spyOn(usersService, 'markEmailConfirmed')
+        .mockRejectedValueOnce(new Error('Confirm update failed'));
+
+      await expect(authService.confirm(rawToken)).rejects.toThrow(
+        'Confirm update failed',
+      );
+
+      const user = await dataSource
+        .getRepository(User)
+        .findOneBy({ id: registered.id });
+      const token = await verificationTokenRepository.findOneBy({
+        user_id: registered.id,
+      });
+      expect(user?.is_confirmed).toBe(false);
+      expect(token?.used_at).toBeNull();
+    });
+  });
+
+  describe('resendConfirmation', () => {
+    it('should invalidate previous confirmation tokens, persist a new token, and send a new email', async () => {
+      const registered = await authService.register({
+        email: 'resend@example.com',
+        password: 'MySecretPassword123',
+      });
+      const firstToken = await extractConfirmationTokenFromLatestEmail();
+
+      await clearMailpitMessages();
+      await authService.resendConfirmation('  Resend@Example.com  ');
+
+      const secondToken = await extractConfirmationTokenFromLatestEmail();
+      expect(secondToken).not.toBe(firstToken);
+
+      const tokens = await verificationTokenRepository.find({
+        where: {
+          user_id: registered.id,
+          type: VerificationTokenType.EMAIL_CONFIRMATION,
+        },
+        order: { created_at: 'ASC' },
+      });
+      expect(tokens).toHaveLength(2);
+
+      const firstHash = createHash('sha256').update(firstToken).digest('hex');
+      const secondHash = createHash('sha256').update(secondToken).digest('hex');
+      const invalidated = tokens.find((t) => t.token_hash === firstHash);
+      const active = tokens.find((t) => t.token_hash === secondHash);
+
+      expect(invalidated?.used_at).toBeInstanceOf(Date);
+      expect(active?.used_at).toBeNull();
+
+      await expect(authService.confirm(firstToken)).rejects.toThrow(
+        InvalidTokenException,
+      );
+      await expect(authService.confirm(secondToken)).resolves.toBeUndefined();
+    });
+
+    it('should not invalidate unused password_reset tokens when resending confirmation', async () => {
+      const registered = await authService.register({
+        email: 'keep-reset@example.com',
+        password: 'MySecretPassword123',
+      });
+      const resetToken = await verificationTokenRepository.save(
+        verificationTokenRepository.create({
+          token_hash: createHash('sha256').update('c'.repeat(64)).digest('hex'),
+          type: VerificationTokenType.PASSWORD_RESET,
+          user_id: registered.id,
+          expires_at: new Date(Date.now() + 60_000),
+          used_at: null,
+        }),
+      );
+
+      await authService.resendConfirmation('keep-reset@example.com');
+
+      const reloadedResetToken = await verificationTokenRepository.findOneBy({
+        id: resetToken.id,
+      });
+      expect(reloadedResetToken?.used_at).toBeNull();
+    });
+
+    it('should return silently without creating tokens or sending email for unknown or already-confirmed users', async () => {
+      const registered = await authService.register({
+        email: 'confirmed@example.com',
+        password: 'MySecretPassword123',
+      });
+      const rawToken = await extractConfirmationTokenFromLatestEmail();
+      await authService.confirm(rawToken);
+      await clearMailpitMessages();
+
+      await expect(
+        authService.resendConfirmation('missing@example.com'),
+      ).resolves.toBeUndefined();
+      await expect(
+        authService.resendConfirmation('confirmed@example.com'),
+      ).resolves.toBeUndefined();
+
+      expect(
+        await verificationTokenRepository.count({
+          where: { user_id: registered.id },
+        }),
+      ).toBe(1);
       expect(await getMailpitMessages()).toHaveLength(0);
     });
   });

@@ -1,7 +1,7 @@
 # Phase 02 — Cadastro, Login e Gerenciamento de Conta — Progress
 
 **Status:** in_progress
-**SIs:** 6/13 completed
+**SIs:** 7/13 completed
 
 ### SI-02.1 — Dependencies, Configuration Namespaces, and Docker Compose
 
@@ -41,9 +41,9 @@
 
 ### SI-02.7 — Email Confirmation (Confirm and Resend)
 
-- **Status:** pending
-- **Tests:** pending
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 3 suites passed (53 tests)
+- **Observations:** Implemented `ConfirmEmailDto`, `ResendConfirmationDto`, `AuthService.confirm`, `AuthService.resendConfirmation`, and `POST /auth/confirm-email` + `POST /auth/resend-confirmation` (`204 No Content`). `confirm` validates token existence/`used_at` (`InvalidTokenException`) before `expires_at <= now` (`TokenExpiredException`), atomically consumes the token (`used_at: IsNull()`), and delegates `is_confirmed = true` update to `UsersService.markEmailConfirmed(userId, manager)` inside `dataSource.transaction()`. `resendConfirmation` normalizes email, returns silently for unknown or already-confirmed users, invalidates unused `email_confirmation` tokens and persists a new SHA-256 token atomically via `createVerificationToken`, then sends the confirmation email outside the transaction. Context7 verification: `typeorm@0.3.31` exact docs (`EntityManager.update` + `IsNull()`); `@nestjs/common@^11.0.1` served current NestJS 11 docs (`@HttpCode(HttpStatus.NO_CONTENT)`); `class-validator@^0.14.4` served closest `v0.15.1` (`@IsString`, `@IsNotEmpty`, `@IsEmail`).
 
 ### SI-02.8 — Login with Credential Validation and Token Issuance
 

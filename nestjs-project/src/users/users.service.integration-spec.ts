@@ -205,4 +205,49 @@ describe('UsersService (integration)', () => {
       expect(found).toBeNull();
     });
   });
+
+  describe('markEmailConfirmed', () => {
+    it('should set is_confirmed to true without EntityManager', async () => {
+      const created = await usersService.createUserWithChannel(
+        'confirm-direct@example.com',
+        'hashed-password',
+      );
+
+      await usersService.markEmailConfirmed(created.id);
+
+      const persistedUser = await userRepository.findOneBy({ id: created.id });
+      expect(persistedUser?.is_confirmed).toBe(true);
+    });
+
+    it('should set is_confirmed to true using provided EntityManager inside a transaction', async () => {
+      const created = await usersService.createUserWithChannel(
+        'confirm-tx@example.com',
+        'hashed-password',
+      );
+
+      await dataSource.transaction((manager) =>
+        usersService.markEmailConfirmed(created.id, manager),
+      );
+
+      const persistedUser = await userRepository.findOneBy({ id: created.id });
+      expect(persistedUser?.is_confirmed).toBe(true);
+    });
+
+    it('should roll back is_confirmed update when outer EntityManager transaction fails', async () => {
+      const created = await usersService.createUserWithChannel(
+        'confirm-rollback@example.com',
+        'hashed-password',
+      );
+
+      await expect(
+        dataSource.transaction(async (manager) => {
+          await usersService.markEmailConfirmed(created.id, manager);
+          throw new Error('Outer transaction failure');
+        }),
+      ).rejects.toThrow('Outer transaction failure');
+
+      const persistedUser = await userRepository.findOneBy({ id: created.id });
+      expect(persistedUser?.is_confirmed).toBe(false);
+    });
+  });
 });
