@@ -1,5 +1,11 @@
 import { ConfigModule } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
+import {
+  getOptionsToken,
+  getStorageToken,
+  type ThrottlerModuleOptions,
+  type ThrottlerStorage,
+} from '@nestjs/throttler';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken, TypeOrmModule } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -8,6 +14,7 @@ import appConfig from '../config/app.config';
 import authConfig from '../config/auth.config';
 import databaseConfig from '../config/database.config';
 import mailConfig from '../config/mail.config';
+import { AUTH_THROTTLE_LIMIT, AUTH_THROTTLE_TTL_MS } from './auth.constants';
 import { AuthModule } from './auth.module';
 import { AuthService } from './auth.service';
 import { RefreshToken } from './entities/refresh-token.entity';
@@ -58,10 +65,17 @@ describe('AuthModule (integration)', () => {
     const verificationTokenRepo = moduleRef.get<Repository<VerificationToken>>(
       getRepositoryToken(VerificationToken),
     );
+    const throttlerStorage = moduleRef.get<ThrottlerStorage>(getStorageToken());
+    const throttlerOptions =
+      moduleRef.get<ThrottlerModuleOptions>(getOptionsToken());
 
     expect(exported.authService).toBeDefined();
     expect(exported.jwtService).toBeDefined();
     expect(refreshTokenRepo).toBeDefined();
     expect(verificationTokenRepo).toBeDefined();
+    expect(throttlerStorage).toBeDefined();
+    expect(throttlerOptions).toEqual([
+      { ttl: AUTH_THROTTLE_TTL_MS, limit: AUTH_THROTTLE_LIMIT },
+    ]);
   });
 });

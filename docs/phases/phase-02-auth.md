@@ -696,19 +696,19 @@ Linearized implementation order: SI-02.1 → SI-02.2, SI-02.3, SI-02.5 (parallel
 
 ## Deliverables
 
-- [ ] User registration with automatic channel creation (nickname from email prefix, atomic transaction)
-- [ ] Email confirmation flow (confirm + resend, 1h token expiry)
-- [ ] Login with JWT access token + JWT refresh token (Argon2id password verification)
-- [ ] Refresh token rotation with family-based theft detection and 10s grace period
-- [ ] Logout revokes all refresh tokens for the user
-- [ ] Password reset flow (forgot + reset, revokes all sessions)
-- [ ] JWT auth guard protecting all endpoints by default, `@Public()` opt-out
-- [ ] Rate limiting on auth endpoints (10 req/min per IP)
-- [ ] Standardized error response format `{ statusCode, error, message }` with domain exception filter
-- [ ] Global ValidationPipe with whitelist and transform
-- [ ] Mailpit service in Docker Compose for local email testing
-- [ ] Email templates (confirmation, password reset) via Handlebars
-- [ ] All SI tests pass (`docker compose exec nestjs-api npm test`)
-- [ ] E2E tests pass (`docker compose exec nestjs-api npm run test:e2e`)
-- [ ] Type/compilation check passes (`docker compose exec nestjs-api npx tsc --noEmit`)
-- [ ] Project builds successfully (`docker compose exec nestjs-api npm run build`)
+- [x] User registration with automatic channel creation (nickname from email prefix, atomic transaction)
+- [x] Email confirmation flow (confirm + resend, 1h token expiry)
+- [x] Login with JWT access token + JWT refresh token (Argon2id password verification)
+- [x] Refresh token rotation with family-based theft detection and 10s grace period
+- [x] Logout revokes all refresh tokens for the user
+- [x] Password reset flow (forgot + reset, revokes all sessions)
+- [x] JWT auth guard protecting all endpoints by default, `@Public()` opt-out
+- [x] Rate limiting on auth endpoints (10 req/min per IP)
+- [x] Standardized error response format `{ statusCode, error, message }` with domain exception filter
+- [x] Global ValidationPipe with whitelist and transform
+- [x] Mailpit service in Docker Compose for local email testing
+- [x] Email templates (confirmation, password reset) via Handlebars
+- [x] All SI tests pass (`docker compose exec nestjs-api npm test`)
+- [x] E2E tests pass (`docker compose exec nestjs-api npm run test:e2e`)
+- [x] Type/compilation check passes (`docker compose exec nestjs-api npx tsc --noEmit`)
+- [x] Project builds successfully (`docker compose exec nestjs-api npm run build`)

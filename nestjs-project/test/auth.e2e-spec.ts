@@ -5,11 +5,18 @@ import {
   ValidationPipe,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
+import {
+  getStorageToken,
+  SkipThrottle,
+  ThrottlerStorageService,
+} from '@nestjs/throttler';
 import { Test, TestingModule } from '@nestjs/testing';
+import type { Express } from 'express';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../src/app.module';
+import { AUTH_THROTTLE_LIMIT } from '../src/auth/auth.constants';
 import type { JwtPayload } from '../src/auth/auth.types';
 import { CurrentUser } from '../src/auth/decorators/current-user.decorator';
 import { RefreshToken } from '../src/auth/entities/refresh-token.entity';
@@ -56,6 +63,7 @@ interface MailpitMessageDetail {
   HTML: string;
 }
 
+@SkipThrottle()
 @Controller('test-protected')
 class TestProtectedController {
   @Get('me')
@@ -73,6 +81,7 @@ describe('AuthController (e2e)', () => {
   let app: INestApplication<App>;
   let dataSource: DataSource;
   let jwtService: JwtService;
+  let throttlerStorage: ThrottlerStorageService;
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -96,6 +105,7 @@ describe('AuthController (e2e)', () => {
     await app.init();
     dataSource = app.get(DataSource);
     jwtService = app.get(JwtService);
+    throttlerStorage = app.get<ThrottlerStorageService>(getStorageToken());
   });
 
   afterAll(async () => {
@@ -103,6 +113,7 @@ describe('AuthController (e2e)', () => {
   });
 
   beforeEach(async () => {
+    throttlerStorage.onApplicationShutdown();
     await clearTestTables(dataSource);
     await clearMailpitMessages();
   });
@@ -1639,6 +1650,163 @@ describe('AuthController (e2e)', () => {
           'property extraField should not exist',
         ]),
       );
+    });
+  });
+
+  describe('Rate Limiting on Auth Endpoints', () => {
+    it('should allow 10 requests within 60s to a public auth endpoint and return 429 Too Many Requests on the 11th request', async () => {
+      for (let i = 0; i < AUTH_THROTTLE_LIMIT; i += 1) {
+        const res = await request(app.getHttpServer())
+          .post('/auth/forgot-password')
+          .send({ email: 'rate-limit@example.com' })
+          .expect(204);
+
+        expect(res.headers['x-ratelimit-limit']).toBe(
+          String(AUTH_THROTTLE_LIMIT),
+        );
+        expect(res.headers['x-ratelimit-remaining']).toBe(
+          String(AUTH_THROTTLE_LIMIT - 1 - i),
+        );
+      }
+
+      const throttledRes = await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'rate-limit@example.com' })
+        .expect(429);
+
+      expect(throttledRes.headers['retry-after']).toBeDefined();
+      expect(
+        throttledRes.body as { statusCode: number; message: string },
+      ).toEqual({
+        statusCode: 429,
+        message: 'ThrottlerException: Too Many Requests',
+      });
+    });
+
+    it('should enforce rate limiting on authenticated POST /auth/logout before JwtAuthGuard', async () => {
+      for (let i = 0; i < AUTH_THROTTLE_LIMIT; i += 1) {
+        await request(app.getHttpServer()).post('/auth/logout').expect(401);
+      }
+
+      await request(app.getHttpServer()).post('/auth/logout').expect(429);
+    });
+
+    it('should return 429 on the 11th authenticated POST /auth/logout request within 60s', async () => {
+      const accessToken = jwtService.sign({
+        sub: '00000000-0000-4000-8000-000000000002',
+        email: 'logout-throttle@example.com',
+      });
+
+      for (let i = 0; i < AUTH_THROTTLE_LIMIT; i += 1) {
+        await request(app.getHttpServer())
+          .post('/auth/logout')
+          .set('Authorization', `Bearer ${accessToken}`)
+          .expect(204);
+      }
+
+      await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(429);
+    });
+
+    it('should not rate-limit public non-auth endpoint GET / even after an auth endpoint is throttled', async () => {
+      for (let i = 0; i < AUTH_THROTTLE_LIMIT; i += 1) {
+        await request(app.getHttpServer())
+          .post('/auth/login')
+          .send({ email: 'nobody@example.com', password: 'WrongPassword123' })
+          .expect(401);
+      }
+
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email: 'nobody@example.com', password: 'WrongPassword123' })
+        .expect(429);
+
+      for (let i = 0; i < AUTH_THROTTLE_LIMIT + 5; i += 1) {
+        const rootRes = await request(app.getHttpServer())
+          .get('/')
+          .expect(200)
+          .expect('Hello World!');
+
+        expect(rootRes.headers['x-ratelimit-limit']).toBeUndefined();
+      }
+    });
+
+    it('should not rate-limit authenticated non-auth endpoints (@SkipThrottle) even after an auth endpoint is throttled', async () => {
+      for (let i = 0; i < AUTH_THROTTLE_LIMIT; i += 1) {
+        await request(app.getHttpServer())
+          .post('/auth/login')
+          .send({ email: 'nobody@example.com', password: 'WrongPassword123' })
+          .expect(401);
+      }
+
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email: 'nobody@example.com', password: 'WrongPassword123' })
+        .expect(429);
+
+      const accessToken = jwtService.sign({
+        sub: '00000000-0000-4000-8000-000000000001',
+        email: 'viewer@example.com',
+      });
+
+      for (let i = 0; i < AUTH_THROTTLE_LIMIT + 5; i += 1) {
+        const protectedRes = await request(app.getHttpServer())
+          .get('/test-protected/me')
+          .set('Authorization', `Bearer ${accessToken}`)
+          .expect(200);
+
+        expect(protectedRes.headers['x-ratelimit-limit']).toBeUndefined();
+      }
+    });
+
+    it('should not allow bypassing rate limit via spoofed X-Forwarded-For header when trust proxy is disabled', async () => {
+      for (let i = 0; i < AUTH_THROTTLE_LIMIT; i += 1) {
+        await request(app.getHttpServer())
+          .post('/auth/forgot-password')
+          .send({ email: 'spoof@example.com' })
+          .expect(204);
+      }
+
+      await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .set('X-Forwarded-For', '203.0.113.99')
+        .send({ email: 'spoof@example.com' })
+        .expect(429);
+    });
+
+    it('should track rate limits per client IP (default ThrottlerGuard behavior)', async () => {
+      const expressApp = app.getHttpAdapter().getInstance() as Express;
+
+      expressApp.set('trust proxy', true);
+      try {
+        for (let i = 0; i < AUTH_THROTTLE_LIMIT; i += 1) {
+          await request(app.getHttpServer())
+            .post('/auth/forgot-password')
+            .set('X-Forwarded-For', '203.0.113.10')
+            .send({ email: 'per-ip@example.com' })
+            .expect(204);
+        }
+
+        await request(app.getHttpServer())
+          .post('/auth/forgot-password')
+          .set('X-Forwarded-For', '203.0.113.10')
+          .send({ email: 'per-ip@example.com' })
+          .expect(429);
+
+        const secondIpRes = await request(app.getHttpServer())
+          .post('/auth/forgot-password')
+          .set('X-Forwarded-For', '203.0.113.20')
+          .send({ email: 'per-ip@example.com' })
+          .expect(204);
+
+        expect(secondIpRes.headers['x-ratelimit-remaining']).toBe(
+          String(AUTH_THROTTLE_LIMIT - 1),
+        );
+      } finally {
+        expressApp.set('trust proxy', false);
+      }
     });
   });
 });

@@ -1,7 +1,7 @@
 # Phase 02 — Cadastro, Login e Gerenciamento de Conta — Progress
 
-**Status:** in_progress
-**SIs:** 12/13 completed
+**Status:** completed
+**SIs:** 13/13 completed
 
 ### SI-02.1 — Dependencies, Configuration Namespaces, and Docker Compose
 
@@ -77,9 +77,9 @@
 
 ### SI-02.13 — Rate Limiting on Auth Endpoints
 
-- **Status:** pending
-- **Tests:** pending
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 2 suites passed (64 tests: 1 in `auth.module.integration-spec.ts`, 63 in E2E) — Full Phase 02 verification: 17 unit/integration suites (173 tests), 2 E2E suites (63 tests)
+- **Observations:** Configured `ThrottlerModule.forRoot([{ ttl: AUTH_THROTTLE_TTL_MS, limit: AUTH_THROTTLE_LIMIT }])` (`60_000` ms, `10` req/min) in `AuthModule` and registered `ThrottlerGuard` as `APP_GUARD` before `JwtAuthGuard` so all `/auth/*` routes (including unauthenticated `POST /auth/logout`) enforce per-IP rate limiting prior to JWT verification. Decorated `AppController` and test-only `TestProtectedController` with `@SkipThrottle()` so non-auth routes remain exempt even with global `APP_GUARD` binding. Compared against commit `03d1f617`, preserved `ThrottlerGuard`-first `APP_GUARD` ordering, single-app `throttlerStorage.onApplicationShutdown()` reset in `beforeEach` over `.storage.clear()` (which leaves `hitExpirations` dirty in `@nestjs/throttler@6.8.0`), and split/expanded E2E tests for single-scenario isolation (`GET /` vs `GET /test-protected/me`), authenticated `POST /auth/logout` throttling, `X-Forwarded-For` spoof resistance with `trust proxy` disabled, and per-IP tracking. Context7 verification: `@nestjs/throttler@^6.8.0` exact `v6.8.0` docs (`ThrottlerModule.forRoot`, `APP_GUARD`, `ThrottlerGuard`, `@SkipThrottle()`, `ThrottlerStorage`).
 
 ## Out-of-Scope Tasks
 
@@ -95,3 +95,6 @@
 - [ ] Evaluate immediate access-token invalidation on logout and password reset (e.g., short-TTL Redis jti denylist or per-user tokens_valid_after timestamp checked in JwtAuthGuard) if stateless JWT access-token validity up to JWT_ACCESS_EXPIRATION is unacceptable for sensitive operations.
 - [ ] Extract shared transactional verification-token helpers in `AuthService` (lookup/expiration validation by `VerificationTokenType`, conditional `used_at` consumption, and prior-token invalidation + replacement) to deduplicate `confirm`/`resendConfirmation` (`SI-02.7`) and `resetPassword`/`forgotPassword` (`SI-02.12`).
 - [ ] Dispatch confirmation and password-reset emails asynchronously via a background job queue (decoupling HTTP response latency from SMTP delivery and mitigating response-time user enumeration on `forgot-password` and `resend-confirmation`).
+- [ ] Scope ThrottlerGuard (or configure tiered global vs auth named throttlers / Redis-backed ThrottlerStorage) before adding non-auth controllers in Phase 03+, since NestJS APP_GUARD applies globally unless controllers opt out with @SkipThrottle() and default ThrottlerStorageService is in-memory per replica.
+- [ ] Externalize rate-limit configuration (`THROTTLE_TTL_MS`, `THROTTLE_LIMIT`) into `authConfig` and `envValidationSchema` via `ThrottlerModule.forRootAsync` so limits can be tuned per environment without code changes.
+- [ ] Evaluate endpoint-specific `@Throttle()` overrides (stricter limits on `forgot-password`, `resend-confirmation`, and `login`) and explicit Express `trust proxy` configuration when deploying behind a reverse proxy/load balancer so `req.ip` resolves the real client IP instead of the proxy IP.
