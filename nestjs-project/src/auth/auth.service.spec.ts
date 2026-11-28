@@ -24,7 +24,11 @@ import { MailService } from '../mail/mail.service';
 import { Channel } from '../users/entities/channel.entity';
 import { User } from '../users/entities/user.entity';
 import { UsersService } from '../users/users.service';
-import { REFRESH_GRACE_PERIOD_MS } from './auth.constants';
+import {
+  AUTH_THROTTLE_LIMIT,
+  AUTH_THROTTLE_TTL_MS,
+  REFRESH_GRACE_PERIOD_MS,
+} from './auth.constants';
 import type { JwtPayload, RefreshTokenPayload } from './auth.types';
 import { AuthService } from './auth.service';
 import { RefreshToken } from './entities/refresh-token.entity';
@@ -40,6 +44,8 @@ const mockAuthConfig: ConfigType<typeof authConfig> = {
   jwtRefreshExpiration: '7d',
   confirmationTokenExpirationHours: 2,
   passwordResetTokenExpirationHours: 1,
+  throttleTtlMs: AUTH_THROTTLE_TTL_MS,
+  throttleLimit: AUTH_THROTTLE_LIMIT,
 };
 
 describe('AuthService (unit)', () => {

@@ -3,6 +3,8 @@ import { envValidationSchema } from './env.validation';
 interface ValidatedEnv {
   JWT_ACCESS_EXPIRATION: string;
   JWT_REFRESH_EXPIRATION: string;
+  THROTTLE_TTL_MS: number;
+  THROTTLE_LIMIT: number;
 }
 
 const validBaseEnv = {
@@ -62,6 +64,56 @@ describe('envValidationSchema (JWT expiration)', () => {
 
       expect(result.error).toBeDefined();
       expect(result.error?.message).toContain('JWT_REFRESH_EXPIRATION');
+    },
+  );
+});
+
+describe('envValidationSchema (rate limiting)', () => {
+  it('should apply default THROTTLE_TTL_MS and THROTTLE_LIMIT when omitted', () => {
+    const result = envValidationSchema.validate(validBaseEnv);
+
+    expect(result.error).toBeUndefined();
+    const value = result.value as ValidatedEnv;
+    expect(value.THROTTLE_TTL_MS).toBe(60000);
+    expect(value.THROTTLE_LIMIT).toBe(10);
+  });
+
+  it('should coerce valid positive integer THROTTLE_TTL_MS and THROTTLE_LIMIT values', () => {
+    const result = envValidationSchema.validate({
+      ...validBaseEnv,
+      THROTTLE_TTL_MS: '30000',
+      THROTTLE_LIMIT: '25',
+    });
+
+    expect(result.error).toBeUndefined();
+    const value = result.value as ValidatedEnv;
+    expect(value.THROTTLE_TTL_MS).toBe(30000);
+    expect(value.THROTTLE_LIMIT).toBe(25);
+  });
+
+  it.each(['0', '-1000', '1.5', 'abc'])(
+    'should reject invalid THROTTLE_TTL_MS "%s"',
+    (invalidTtl) => {
+      const result = envValidationSchema.validate({
+        ...validBaseEnv,
+        THROTTLE_TTL_MS: invalidTtl,
+      });
+
+      expect(result.error).toBeDefined();
+      expect(result.error?.message).toContain('THROTTLE_TTL_MS');
+    },
+  );
+
+  it.each(['0', '-5', '2.5', 'ten'])(
+    'should reject invalid THROTTLE_LIMIT "%s"',
+    (invalidLimit) => {
+      const result = envValidationSchema.validate({
+        ...validBaseEnv,
+        THROTTLE_LIMIT: invalidLimit,
+      });
+
+      expect(result.error).toBeDefined();
+      expect(result.error?.message).toContain('THROTTLE_LIMIT');
     },
   );
 });

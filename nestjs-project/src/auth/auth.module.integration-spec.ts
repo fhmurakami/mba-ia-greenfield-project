@@ -78,4 +78,37 @@ describe('AuthModule (integration)', () => {
       { ttl: AUTH_THROTTLE_TTL_MS, limit: AUTH_THROTTLE_LIMIT },
     ]);
   });
+
+  it('should wire custom throttleTtlMs and throttleLimit from authConfig into ThrottlerModule', async () => {
+    const customModuleRef = await Test.createTestingModule({
+      imports: [
+        ConfigModule.forRoot({
+          isGlobal: true,
+          load: [appConfig, databaseConfig, authConfig, mailConfig],
+        }),
+        TypeOrmModule.forRoot(getTestTypeOrmOptions()),
+        AuthModule,
+      ],
+    })
+      .overrideProvider(authConfig.KEY)
+      .useValue({
+        jwtSecret: 'test-secret',
+        jwtRefreshSecret: 'test-refresh-secret',
+        jwtAccessExpiration: '15m',
+        jwtRefreshExpiration: '7d',
+        confirmationTokenExpirationHours: 1,
+        passwordResetTokenExpirationHours: 1,
+        throttleTtlMs: 30_000,
+        throttleLimit: 25,
+      })
+      .compile();
+
+    try {
+      const throttlerOptions =
+        customModuleRef.get<ThrottlerModuleOptions>(getOptionsToken());
+      expect(throttlerOptions).toEqual([{ ttl: 30_000, limit: 25 }]);
+    } finally {
+      await customModuleRef.close();
+    }
+  });
 });
