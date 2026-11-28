@@ -25,6 +25,7 @@ import { Channel } from '../users/entities/channel.entity';
 import { User } from '../users/entities/user.entity';
 import { UsersService } from '../users/users.service';
 import { REFRESH_GRACE_PERIOD_MS } from './auth.constants';
+import type { JwtPayload, RefreshTokenPayload } from './auth.types';
 import { AuthService } from './auth.service';
 import { RefreshToken } from './entities/refresh-token.entity';
 import {
@@ -697,23 +698,17 @@ describe('AuthService (unit)', () => {
         'alice@example.com',
       );
 
-      const accessPayload = jwtService.verify<{
-        sub: string;
-        email: string;
-        iat: number;
-        exp: number;
-      }>(result.access_token);
+      const accessPayload = jwtService.verify<Required<JwtPayload>>(
+        result.access_token,
+      );
       expect(accessPayload.sub).toBe('user-uuid-1');
       expect(accessPayload.email).toBe('alice@example.com');
       expect(accessPayload.exp - accessPayload.iat).toBe(15 * 60);
 
-      const refreshPayload = jwtService.verify<{
-        sub: string;
-        family: string;
-        jti: string;
-        iat: number;
-        exp: number;
-      }>(result.refresh_token, { secret: mockAuthConfig.jwtRefreshSecret });
+      const refreshPayload = jwtService.verify<Required<RefreshTokenPayload>>(
+        result.refresh_token,
+        { secret: mockAuthConfig.jwtRefreshSecret },
+      );
       expect(refreshPayload.sub).toBe('user-uuid-1');
       expect(refreshPayload.family).toMatch(
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
@@ -798,14 +793,17 @@ describe('AuthService (unit)', () => {
       family: string,
       secret = mockAuthConfig.jwtRefreshSecret,
       expiresIn = mockAuthConfig.jwtRefreshExpiration,
-    ): string =>
-      jwtService.sign(
-        { sub: userId, family, jti: randomUUID() },
-        {
-          secret,
-          expiresIn,
-        },
-      );
+    ): string => {
+      const payload: RefreshTokenPayload = {
+        sub: userId,
+        family,
+        jti: randomUUID(),
+      };
+      return jwtService.sign(payload, {
+        secret,
+        expiresIn,
+      });
+    };
 
     const createStoredRefreshToken = (
       rawToken: string,
@@ -846,19 +844,14 @@ describe('AuthService (unit)', () => {
       expect(entityManager.save).toHaveBeenCalledTimes(1);
       expect(result.refresh_token).not.toBe(rawToken);
 
-      const accessPayload = jwtService.verify<{
-        sub: string;
-        email: string;
-      }>(result.access_token);
+      const accessPayload = jwtService.verify<JwtPayload>(result.access_token);
       expect(accessPayload.sub).toBe(userId);
       expect(accessPayload.email).toBe(userEmail);
 
-      const rotatedPayload = jwtService.verify<{
-        sub: string;
-        family: string;
-        jti: string;
-        exp: number;
-      }>(result.refresh_token, { secret: mockAuthConfig.jwtRefreshSecret });
+      const rotatedPayload = jwtService.verify<Required<RefreshTokenPayload>>(
+        result.refresh_token,
+        { secret: mockAuthConfig.jwtRefreshSecret },
+      );
       expect(rotatedPayload.sub).toBe(userId);
       expect(rotatedPayload.family).toBe(family);
 
@@ -974,11 +967,9 @@ describe('AuthService (unit)', () => {
       const graceResult = await authService.refresh(token1);
 
       expect(graceResult.refresh_token).toBe(token2);
-      expect(
-        jwtService.verify<{ sub: string; email: string }>(
-          graceResult.access_token,
-        ).sub,
-      ).toBe(userId);
+      expect(jwtService.verify<JwtPayload>(graceResult.access_token).sub).toBe(
+        userId,
+      );
       expect(refreshTokenRepository.findOne).toHaveBeenLastCalledWith({
         where: { family, revoked_at: IsNull() },
         order: { created_at: 'DESC' },
@@ -1070,7 +1061,7 @@ describe('AuthService (unit)', () => {
 
       const result = await authService.refresh(token1);
 
-      expect(jwtService.verify<{ sub: string }>(result.access_token).sub).toBe(
+      expect(jwtService.verify<JwtPayload>(result.access_token).sub).toBe(
         userId,
       );
       expect(entityManager.save).not.toHaveBeenCalled();

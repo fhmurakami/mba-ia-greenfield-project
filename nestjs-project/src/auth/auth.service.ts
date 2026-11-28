@@ -18,6 +18,7 @@ import authConfig from '../config/auth.config';
 import { MailService } from '../mail/mail.service';
 import { UsersService } from '../users/users.service';
 import { REFRESH_GRACE_PERIOD_MS } from './auth.constants';
+import type { JwtPayload, RefreshTokenPayload } from './auth.types';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { RefreshToken } from './entities/refresh-token.entity';
@@ -417,12 +418,10 @@ export class AuthService {
   }
 
   private signAccessToken(userId: string, email: string): string {
-    return this.jwtService.sign(
-      { sub: userId, email },
-      {
-        expiresIn: this.auth.jwtAccessExpiration,
-      },
-    );
+    const payload: JwtPayload = { sub: userId, email };
+    return this.jwtService.sign(payload, {
+      expiresIn: this.auth.jwtAccessExpiration,
+    });
   }
 
   private buildRefreshToken(
@@ -430,15 +429,17 @@ export class AuthService {
     family: string,
   ): { rawToken: string; entity: RefreshToken } {
     const tokenId = randomUUID();
-    const rawToken = this.jwtService.sign(
-      { sub: userId, family, jti: tokenId },
-      {
-        secret: this.auth.jwtRefreshSecret,
-        expiresIn: this.auth.jwtRefreshExpiration,
-      },
-    );
+    const payload: RefreshTokenPayload = {
+      sub: userId,
+      family,
+      jti: tokenId,
+    };
+    const rawToken = this.jwtService.sign(payload, {
+      secret: this.auth.jwtRefreshSecret,
+      expiresIn: this.auth.jwtRefreshExpiration,
+    });
 
-    const decodedRefresh = this.jwtService.decode<{ exp?: number } | null>(
+    const decodedRefresh = this.jwtService.decode<RefreshTokenPayload | null>(
       rawToken,
     );
     if (!decodedRefresh || typeof decodedRefresh.exp !== 'number') {
@@ -458,15 +459,12 @@ export class AuthService {
   }
 
   private verifyRefreshJwt(rawToken: string, storedToken: RefreshToken): void {
-    let payload: { sub?: unknown; family?: unknown };
+    let payload: Partial<RefreshTokenPayload>;
     try {
-      payload = this.jwtService.verify<{ sub?: unknown; family?: unknown }>(
-        rawToken,
-        {
-          secret: this.auth.jwtRefreshSecret,
-          ignoreExpiration: true,
-        },
-      );
+      payload = this.jwtService.verify<Partial<RefreshTokenPayload>>(rawToken, {
+        secret: this.auth.jwtRefreshSecret,
+        ignoreExpiration: true,
+      });
     } catch {
       throw new InvalidTokenException();
     }

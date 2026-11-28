@@ -32,6 +32,7 @@ import { User } from '../users/entities/user.entity';
 import { UsersService } from '../users/users.service';
 import { AuthModule } from './auth.module';
 import { AuthService } from './auth.service';
+import type { JwtPayload, RefreshTokenPayload } from './auth.types';
 import { RefreshToken } from './entities/refresh-token.entity';
 import {
   VerificationToken,
@@ -502,19 +503,14 @@ describe('AuthService (integration)', () => {
         password: 'MySecretPassword123',
       });
 
-      const accessPayload = jwtService.verify<{
-        sub: string;
-        email: string;
-      }>(result.access_token);
+      const accessPayload = jwtService.verify<JwtPayload>(result.access_token);
       expect(accessPayload.sub).toBe(registered.id);
       expect(accessPayload.email).toBe('login-int@example.com');
 
-      const refreshPayload = jwtService.verify<{
-        sub: string;
-        family: string;
-        jti: string;
-        exp: number;
-      }>(result.refresh_token, { secret: authCfg.jwtRefreshSecret });
+      const refreshPayload = jwtService.verify<Required<RefreshTokenPayload>>(
+        result.refresh_token,
+        { secret: authCfg.jwtRefreshSecret },
+      );
       expect(refreshPayload.sub).toBe(registered.id);
       expect(refreshPayload.family).toMatch(
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
@@ -545,11 +541,11 @@ describe('AuthService (integration)', () => {
         password: 'MySecretPassword123',
       });
 
-      const firstRefresh = jwtService.verify<{ family: string }>(
+      const firstRefresh = jwtService.verify<RefreshTokenPayload>(
         first.refresh_token,
         { secret: authCfg.jwtRefreshSecret },
       );
-      const secondRefresh = jwtService.verify<{ family: string }>(
+      const secondRefresh = jwtService.verify<RefreshTokenPayload>(
         second.refresh_token,
         { secret: authCfg.jwtRefreshSecret },
       );
@@ -626,16 +622,16 @@ describe('AuthService (integration)', () => {
       const rotated1 = await authService.refresh(token1);
       expect(rotated1.refresh_token).not.toBe(token1);
 
-      const payload1 = jwtService.verify<{ family: string }>(token1, {
+      const payload1 = jwtService.verify<RefreshTokenPayload>(token1, {
         secret: authCfg.jwtRefreshSecret,
       });
-      const payload2 = jwtService.verify<{ family: string }>(
+      const payload2 = jwtService.verify<RefreshTokenPayload>(
         rotated1.refresh_token,
         { secret: authCfg.jwtRefreshSecret },
       );
       expect(payload2.family).toBe(payload1.family);
 
-      const accessPayload = jwtService.verify<{ sub: string; email: string }>(
+      const accessPayload = jwtService.verify<JwtPayload>(
         rotated1.access_token,
       );
       expect(accessPayload.sub).toBe(userId);
@@ -688,9 +684,9 @@ describe('AuthService (integration)', () => {
       const graceResult = await authService.refresh(token1);
 
       expect(graceResult.refresh_token).toBe(rotated1.refresh_token);
-      expect(
-        jwtService.verify<{ sub: string }>(graceResult.access_token).sub,
-      ).toBe(userId);
+      expect(jwtService.verify<JwtPayload>(graceResult.access_token).sub).toBe(
+        userId,
+      );
 
       const tokens = await refreshTokenRepository.find({
         where: { user_id: userId },
@@ -745,11 +741,11 @@ describe('AuthService (integration)', () => {
         TokenReuseDetectedException,
       );
 
-      const familyADecoded = jwtService.verify<{ family: string }>(
+      const familyADecoded = jwtService.verify<RefreshTokenPayload>(
         familyAToken1,
         { secret: authCfg.jwtRefreshSecret },
       );
-      const familyBDecoded = jwtService.verify<{ family: string }>(
+      const familyBDecoded = jwtService.verify<RefreshTokenPayload>(
         otherLogin.refresh_token,
         { secret: authCfg.jwtRefreshSecret },
       );

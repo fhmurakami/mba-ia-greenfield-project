@@ -12,7 +12,7 @@ import { App } from 'supertest/types';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../src/app.module';
 import { AUTH_THROTTLE_LIMIT } from '../src/auth/auth.constants';
-import type { JwtPayload } from '../src/auth/auth.types';
+import type { JwtPayload, RefreshTokenPayload } from '../src/auth/auth.types';
 import { CurrentUser } from '../src/auth/decorators/current-user.decorator';
 import { RefreshToken } from '../src/auth/entities/refresh-token.entity';
 import {
@@ -573,10 +573,7 @@ describe('AuthController (e2e)', () => {
       expect(typeof body.access_token).toBe('string');
       expect(typeof body.refresh_token).toBe('string');
 
-      const accessPayload = jwtService.verify<{
-        sub: string;
-        email: string;
-      }>(body.access_token);
+      const accessPayload = jwtService.verify<JwtPayload>(body.access_token);
       expect(accessPayload.sub).toBe(userId);
       expect(accessPayload.email).toBe('login-e2e@example.com');
 
@@ -863,10 +860,10 @@ describe('AuthController (e2e)', () => {
         .set('Authorization', `Bearer ${body.access_token}`)
         .expect(200);
 
-      const initialDecoded = jwtService.decode<{ family: string } | null>(
+      const initialDecoded = jwtService.decode<RefreshTokenPayload | null>(
         initialRefreshToken,
       );
-      const rotatedDecoded = jwtService.decode<{ family: string } | null>(
+      const rotatedDecoded = jwtService.decode<RefreshTokenPayload | null>(
         body.refresh_token,
       );
       expect(rotatedDecoded?.family).toBe(initialDecoded?.family);
