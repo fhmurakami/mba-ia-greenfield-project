@@ -1,5 +1,7 @@
 import * as Joi from 'joi';
 
+export const JWT_EXPIRATION_PATTERN = /^[1-9]\d*(ms|[smhd])$/;
+
 export const envValidationSchema = Joi.object({
   NODE_ENV: Joi.string()
     .valid('development', 'production', 'test')
@@ -13,8 +15,12 @@ export const envValidationSchema = Joi.object({
   DB_NAME: Joi.string().required(),
   JWT_SECRET: Joi.string().required(),
   JWT_REFRESH_SECRET: Joi.string().required(),
-  JWT_ACCESS_EXPIRATION: Joi.string().default('15m'),
-  JWT_REFRESH_EXPIRATION: Joi.string().default('7d'),
+  JWT_ACCESS_EXPIRATION: Joi.string()
+    .pattern(JWT_EXPIRATION_PATTERN)
+    .default('15m'),
+  JWT_REFRESH_EXPIRATION: Joi.string()
+    .pattern(JWT_EXPIRATION_PATTERN)
+    .default('7d'),
   CONFIRMATION_TOKEN_EXPIRATION_HOURS: Joi.number().default(1),
   PASSWORD_RESET_TOKEN_EXPIRATION_HOURS: Joi.number().default(1),
   MAIL_HOST: Joi.string().default('mailpit'),

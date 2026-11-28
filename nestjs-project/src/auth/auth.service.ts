@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import * as argon2 from 'argon2';
 import { Inject, Injectable } from '@nestjs/common';
 import type { ConfigType } from '@nestjs/config';
-import { JwtService, type JwtSignOptions } from '@nestjs/jwt';
+import { JwtService } from '@nestjs/jwt';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, EntityManager, IsNull, Repository } from 'typeorm';
 import {
@@ -419,7 +419,7 @@ export class AuthService {
     return this.jwtService.sign(
       { sub: userId, email },
       {
-        expiresIn: this.auth.jwtAccessExpiration as JwtSignOptions['expiresIn'],
+        expiresIn: this.auth.jwtAccessExpiration,
       },
     );
   }
@@ -433,8 +433,7 @@ export class AuthService {
       { sub: userId, family, jti: tokenId },
       {
         secret: this.auth.jwtRefreshSecret,
-        expiresIn: this.auth
-          .jwtRefreshExpiration as JwtSignOptions['expiresIn'],
+        expiresIn: this.auth.jwtRefreshExpiration,
       },
     );
 

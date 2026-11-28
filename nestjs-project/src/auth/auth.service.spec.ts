@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import * as argon2 from 'argon2';
 import type { ConfigType } from '@nestjs/config';
-import { JwtModule, JwtService, type JwtSignOptions } from '@nestjs/jwt';
+import { JwtModule, JwtService } from '@nestjs/jwt';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import {
@@ -106,8 +106,7 @@ describe('AuthService (unit)', () => {
         JwtModule.register({
           secret: mockAuthConfig.jwtSecret,
           signOptions: {
-            expiresIn:
-              mockAuthConfig.jwtAccessExpiration as JwtSignOptions['expiresIn'],
+            expiresIn: mockAuthConfig.jwtAccessExpiration,
           },
         }),
       ],
@@ -804,7 +803,7 @@ describe('AuthService (unit)', () => {
         { sub: userId, family, jti: randomUUID() },
         {
           secret,
-          expiresIn: expiresIn as JwtSignOptions['expiresIn'],
+          expiresIn,
         },
       );
 

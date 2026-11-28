@@ -84,7 +84,7 @@
 ## Out-of-Scope Tasks
 
 - [x] Extract duplicated global pipes/filters configuration between `src/main.ts` and `test/auth.e2e-spec.ts` into a shared bootstrap helper (per `testing-guide-nestjs-project/references/gotchas.md` §2).
-- [ ] Type `jwtAccessExpiration` and `jwtRefreshExpiration` as `JwtSignOptions['expiresIn']` in `src/config/auth.config.ts` and validate duration format (e.g., `/^\d+[smhd]$/`) in `src/config/env.validation.ts` so invalid expiration strings fail at startup and redundant type assertions in `AuthModule`/`AuthService` are removed.
+- [x] Type `jwtAccessExpiration` and `jwtRefreshExpiration` as `JwtSignOptions['expiresIn']` in `src/config/auth.config.ts` and validate duration format (e.g., `/^\d+[smhd]$/`) in `src/config/env.validation.ts` so invalid expiration strings fail at startup and redundant type assertions in `AuthModule`/`AuthService` are removed.
 - [ ] Extract duplicated email normalization (`email.trim().toLowerCase()`) between `UsersService` and `AuthService` into a shared utility helper.
 - [ ] Adopt `JwtPayload` (and a typed `RefreshTokenPayload`) from `src/auth/auth.types.ts` in `AuthService` token signing/decoding and login E2E assertions so JWT payload contracts share a single source of truth.
 - [ ] Evaluate whether an authenticated session-inspection endpoint (e.g., `GET /auth/me` as in reference commit `c927802`, or `GET /users/me` in Phase 03) should be formally added to the API contract with an explicit rate-limit policy.
