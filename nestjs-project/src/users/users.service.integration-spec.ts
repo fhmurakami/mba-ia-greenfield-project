@@ -274,4 +274,53 @@ describe('UsersService (integration)', () => {
       expect(found).toBeNull();
     });
   });
+
+  describe('updatePassword', () => {
+    it('should update persisted password hash without EntityManager', async () => {
+      const created = await usersService.createUserWithChannel(
+        'pw-direct@example.com',
+        'old-hashed-password',
+      );
+
+      await usersService.updatePassword(created.id, 'new-hashed-password');
+
+      const found = await usersService.findByEmail('pw-direct@example.com');
+      expect(found?.password).toBe('new-hashed-password');
+    });
+
+    it('should update persisted password hash using provided EntityManager inside a transaction', async () => {
+      const created = await usersService.createUserWithChannel(
+        'pw-tx@example.com',
+        'old-hashed-password',
+      );
+
+      await dataSource.transaction((manager) =>
+        usersService.updatePassword(created.id, 'new-hashed-password', manager),
+      );
+
+      const found = await usersService.findByEmail('pw-tx@example.com');
+      expect(found?.password).toBe('new-hashed-password');
+    });
+
+    it('should roll back password update when outer EntityManager transaction fails', async () => {
+      const created = await usersService.createUserWithChannel(
+        'pw-rollback@example.com',
+        'old-hashed-password',
+      );
+
+      await expect(
+        dataSource.transaction(async (manager) => {
+          await usersService.updatePassword(
+            created.id,
+            'new-hashed-password',
+            manager,
+          );
+          throw new Error('Outer transaction failure');
+        }),
+      ).rejects.toThrow('Outer transaction failure');
+
+      const found = await usersService.findByEmail('pw-rollback@example.com');
+      expect(found?.password).toBe('old-hashed-password');
+    });
+  });
 });

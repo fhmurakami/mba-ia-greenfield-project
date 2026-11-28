@@ -120,6 +120,21 @@ describe('AuthService (integration)', () => {
     return match![1];
   };
 
+  const extractPasswordResetTokenFromLatestEmail =
+    async (): Promise<string> => {
+      const messages = (await getMailpitMessages()) as MailpitMessageSummary[];
+      expect(messages.length).toBeGreaterThan(0);
+
+      const detail = (await getMailpitMessage(
+        messages[0].ID,
+      )) as MailpitMessageDetail;
+      const match = /\/auth\/reset-password\?token=([a-f0-9]{64})/.exec(
+        detail.HTML,
+      );
+      expect(match).not.toBeNull();
+      return match![1];
+    };
+
   describe('register', () => {
     it('should persist unconfirmed user with Argon2 password hash and sanitized channel', async () => {
       const result = await authService.register({
@@ -910,6 +925,314 @@ describe('AuthService (integration)', () => {
       await expect(
         authService.refresh(userB.refresh_token),
       ).resolves.toBeDefined();
+    });
+  });
+
+  describe('forgotPassword', () => {
+    it('should persist password_reset token and deliver email with channel name and matching SHA-256 token', async () => {
+      const registered = await authService.register({
+        email: 'forgot@example.com',
+        password: 'MySecretPassword123',
+      });
+      await clearMailpitMessages();
+
+      await authService.forgotPassword('  Forgot@Example.com  ');
+
+      const resetTokens = await verificationTokenRepository.find({
+        where: {
+          user_id: registered.id,
+          type: VerificationTokenType.PASSWORD_RESET,
+        },
+      });
+      expect(resetTokens).toHaveLength(1);
+      expect(resetTokens[0].used_at).toBeNull();
+      expect(resetTokens[0].expires_at.getTime()).toBeGreaterThan(Date.now());
+
+      const messages = (await getMailpitMessages()) as MailpitMessageSummary[];
+      expect(messages).toHaveLength(1);
+      expect(messages[0].To[0].Address).toBe('forgot@example.com');
+      expect(messages[0].Subject).toBe(MAIL_SUBJECTS.PASSWORD_RESET);
+
+      const detail = (await getMailpitMessage(
+        messages[0].ID,
+      )) as MailpitMessageDetail;
+      expect(detail.HTML).toContain('forgot');
+      const rawToken = await extractPasswordResetTokenFromLatestEmail();
+      const expectedHash = createHash('sha256').update(rawToken).digest('hex');
+      expect(resetTokens[0].token_hash).toBe(expectedHash);
+    });
+
+    it('should invalidate previous unused password_reset tokens without invalidating email_confirmation tokens', async () => {
+      const registered = await authService.register({
+        email: 'forgot-invalidate@example.com',
+        password: 'MySecretPassword123',
+      });
+      await clearMailpitMessages();
+
+      await authService.forgotPassword('forgot-invalidate@example.com');
+      const firstResetToken = await extractPasswordResetTokenFromLatestEmail();
+      await clearMailpitMessages();
+
+      await authService.forgotPassword('forgot-invalidate@example.com');
+      const secondResetToken = await extractPasswordResetTokenFromLatestEmail();
+      expect(secondResetToken).not.toBe(firstResetToken);
+
+      const resetTokens = await verificationTokenRepository.find({
+        where: {
+          user_id: registered.id,
+          type: VerificationTokenType.PASSWORD_RESET,
+        },
+      });
+      expect(resetTokens).toHaveLength(2);
+
+      const firstHash = createHash('sha256')
+        .update(firstResetToken)
+        .digest('hex');
+      const secondHash = createHash('sha256')
+        .update(secondResetToken)
+        .digest('hex');
+      expect(
+        resetTokens.find((t) => t.token_hash === firstHash)?.used_at,
+      ).toBeInstanceOf(Date);
+      expect(
+        resetTokens.find((t) => t.token_hash === secondHash)?.used_at,
+      ).toBeNull();
+
+      const confirmationToken = await verificationTokenRepository.findOneBy({
+        user_id: registered.id,
+        type: VerificationTokenType.EMAIL_CONFIRMATION,
+      });
+      expect(confirmationToken?.used_at).toBeNull();
+    });
+
+    it('should return silently without creating tokens or sending email for unknown email', async () => {
+      await expect(
+        authService.forgotPassword('missing@example.com'),
+      ).resolves.toBeUndefined();
+
+      expect(await verificationTokenRepository.count()).toBe(0);
+      expect(await getMailpitMessages()).toHaveLength(0);
+    });
+  });
+
+  describe('resetPassword', () => {
+    const registerConfirmAndLogin = async (
+      email: string,
+    ): Promise<{
+      userId: string;
+      access_token: string;
+      refresh_token: string;
+    }> => {
+      const registered = await authService.register({
+        email,
+        password: 'MySecretPassword123',
+      });
+      const rawToken = await extractConfirmationTokenFromLatestEmail();
+      await authService.confirm(rawToken);
+      const tokens = await authService.login({
+        email,
+        password: 'MySecretPassword123',
+      });
+      await clearMailpitMessages();
+      return {
+        userId: registered.id,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+      };
+    };
+
+    it('should update password hash, mark token used, and revoke all user refresh tokens without affecting other users', async () => {
+      const userA = await registerConfirmAndLogin('reset-user-a@example.com');
+      const userB = await registerConfirmAndLogin('reset-user-b@example.com');
+
+      await authService.forgotPassword('reset-user-a@example.com');
+      const resetToken = await extractPasswordResetTokenFromLatestEmail();
+
+      await authService.resetPassword(resetToken, 'NewSecretPassword456');
+
+      const reloadedUserA = await usersService.findByEmail(
+        'reset-user-a@example.com',
+      );
+      expect(
+        await argon2.verify(
+          reloadedUserA?.password ?? '',
+          'NewSecretPassword456',
+        ),
+      ).toBe(true);
+
+      const usedToken = await verificationTokenRepository.findOneBy({
+        user_id: userA.userId,
+        type: VerificationTokenType.PASSWORD_RESET,
+      });
+      expect(usedToken?.used_at).toBeInstanceOf(Date);
+
+      const userARefreshTokens = await refreshTokenRepository.find({
+        where: { user_id: userA.userId },
+      });
+      expect(userARefreshTokens).toHaveLength(1);
+      expect(userARefreshTokens[0].revoked_at).toBeInstanceOf(Date);
+
+      const userBRefreshTokens = await refreshTokenRepository.find({
+        where: { user_id: userB.userId },
+      });
+      expect(userBRefreshTokens).toHaveLength(1);
+      expect(userBRefreshTokens[0].revoked_at).toBeNull();
+    });
+
+    it('should allow login with new password and reject old password with InvalidCredentialsException after resetPassword', async () => {
+      await registerConfirmAndLogin('reset-login-int@example.com');
+      await authService.forgotPassword('reset-login-int@example.com');
+      const resetToken = await extractPasswordResetTokenFromLatestEmail();
+
+      await authService.resetPassword(resetToken, 'NewSecretPassword456');
+
+      await expect(
+        authService.login({
+          email: 'reset-login-int@example.com',
+          password: 'MySecretPassword123',
+        }),
+      ).rejects.toThrow(InvalidCredentialsException);
+
+      const loginResult = await authService.login({
+        email: 'reset-login-int@example.com',
+        password: 'NewSecretPassword456',
+      });
+      expect(typeof loginResult.access_token).toBe('string');
+      expect(typeof loginResult.refresh_token).toBe('string');
+    });
+
+    it('should reject post-reset refresh within 10s grace period with InvalidTokenException for both rotated and latest tokens', async () => {
+      const { refresh_token: token1 } = await registerConfirmAndLogin(
+        'reset-grace-int@example.com',
+      );
+      const { refresh_token: token2 } = await authService.refresh(token1);
+
+      await authService.forgotPassword('reset-grace-int@example.com');
+      const resetToken = await extractPasswordResetTokenFromLatestEmail();
+      await authService.resetPassword(resetToken, 'NewSecretPassword456');
+
+      await expect(authService.refresh(token1)).rejects.toThrow(
+        InvalidTokenException,
+      );
+      await expect(authService.refresh(token2)).rejects.toThrow(
+        InvalidTokenException,
+      );
+    });
+
+    it('should throw InvalidTokenException when password_reset token is unknown', async () => {
+      await expect(
+        authService.resetPassword('0'.repeat(64), 'NewSecretPassword456'),
+      ).rejects.toThrow(InvalidTokenException);
+    });
+
+    it('should throw InvalidTokenException when passing an email_confirmation token to resetPassword', async () => {
+      await authService.register({
+        email: 'reset-wrong-type-int@example.com',
+        password: 'MySecretPassword123',
+      });
+      const confirmToken = await extractConfirmationTokenFromLatestEmail();
+
+      await expect(
+        authService.resetPassword(confirmToken, 'NewSecretPassword456'),
+      ).rejects.toThrow(InvalidTokenException);
+    });
+
+    it('should throw InvalidTokenException when reusing an already-consumed password_reset token', async () => {
+      const registered = await authService.register({
+        email: 'reset-reuse-int@example.com',
+        password: 'MySecretPassword123',
+      });
+      const confirmToken = await extractConfirmationTokenFromLatestEmail();
+      await authService.confirm(confirmToken);
+      await clearMailpitMessages();
+
+      await authService.forgotPassword('reset-reuse-int@example.com');
+      const resetToken = await extractPasswordResetTokenFromLatestEmail();
+      await authService.resetPassword(resetToken, 'NewSecretPassword456');
+
+      await expect(
+        authService.resetPassword(resetToken, 'AnotherPassword789'),
+      ).rejects.toThrow(InvalidTokenException);
+
+      const reloadedUser = await usersService.findByEmail(
+        'reset-reuse-int@example.com',
+      );
+      expect(reloadedUser?.id).toBe(registered.id);
+      expect(
+        await argon2.verify(
+          reloadedUser?.password ?? '',
+          'NewSecretPassword456',
+        ),
+      ).toBe(true);
+    });
+
+    it('should throw TokenExpiredException when password_reset token is expired without updating password or revoking refresh tokens', async () => {
+      const { userId } = await registerConfirmAndLogin(
+        'reset-expired-int@example.com',
+      );
+      await authService.forgotPassword('reset-expired-int@example.com');
+      const resetToken = await extractPasswordResetTokenFromLatestEmail();
+
+      await verificationTokenRepository.update(
+        { user_id: userId, type: VerificationTokenType.PASSWORD_RESET },
+        { expires_at: new Date(Date.now() - 60_000) },
+      );
+
+      await expect(
+        authService.resetPassword(resetToken, 'NewSecretPassword456'),
+      ).rejects.toThrow(TokenExpiredException);
+
+      const reloadedUser = await usersService.findByEmail(
+        'reset-expired-int@example.com',
+      );
+      expect(
+        await argon2.verify(
+          reloadedUser?.password ?? '',
+          'MySecretPassword123',
+        ),
+      ).toBe(true);
+
+      const refreshTokens = await refreshTokenRepository.find({
+        where: { user_id: userId },
+      });
+      expect(refreshTokens[0].revoked_at).toBeNull();
+    });
+
+    it('should roll back token used_at and refresh token revocation when updatePassword fails inside transaction', async () => {
+      const { userId } = await registerConfirmAndLogin(
+        'reset-rollback-int@example.com',
+      );
+      await authService.forgotPassword('reset-rollback-int@example.com');
+      const resetToken = await extractPasswordResetTokenFromLatestEmail();
+
+      jest
+        .spyOn(usersService, 'updatePassword')
+        .mockRejectedValueOnce(new Error('Password update failed'));
+
+      await expect(
+        authService.resetPassword(resetToken, 'NewSecretPassword456'),
+      ).rejects.toThrow('Password update failed');
+
+      const storedResetToken = await verificationTokenRepository.findOneBy({
+        user_id: userId,
+        type: VerificationTokenType.PASSWORD_RESET,
+      });
+      expect(storedResetToken?.used_at).toBeNull();
+
+      const refreshTokens = await refreshTokenRepository.find({
+        where: { user_id: userId },
+      });
+      expect(refreshTokens[0].revoked_at).toBeNull();
+
+      const reloadedUser = await usersService.findByEmail(
+        'reset-rollback-int@example.com',
+      );
+      expect(
+        await argon2.verify(
+          reloadedUser?.password ?? '',
+          'MySecretPassword123',
+        ),
+      ).toBe(true);
     });
   });
 });

@@ -414,4 +414,31 @@ describe('UsersService (unit)', () => {
       expect(userRepository.update).not.toHaveBeenCalled();
     });
   });
+
+  describe('updatePassword', () => {
+    it('should update password via userRepository when manager is omitted', async () => {
+      await usersService.updatePassword('user-uuid-1', 'new-hashed-password');
+
+      expect(userRepository.update).toHaveBeenCalledWith(
+        { id: 'user-uuid-1' },
+        { password: 'new-hashed-password' },
+      );
+      expect(txManager.update).not.toHaveBeenCalled();
+    });
+
+    it('should update password via provided EntityManager when manager is passed', async () => {
+      await usersService.updatePassword(
+        'user-uuid-1',
+        'new-hashed-password',
+        txManager as unknown as EntityManager,
+      );
+
+      expect(txManager.update).toHaveBeenCalledWith(
+        User,
+        { id: 'user-uuid-1' },
+        { password: 'new-hashed-password' },
+      );
+      expect(userRepository.update).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -267,10 +267,105 @@ export class AuthService {
   }
 
   async logout(userId: string): Promise<void> {
-    await this.refreshTokenRepository.update(
-      { user_id: userId, revoked_at: IsNull() },
-      { revoked_at: new Date(Date.now()) },
+    await this.revokeUserRefreshTokens(userId, new Date(Date.now()));
+  }
+
+  async forgotPassword(email: string): Promise<void> {
+    const normalizedEmail = email.trim().toLowerCase();
+    const user = await this.usersService.findByEmail(normalizedEmail);
+
+    if (!user) {
+      return;
+    }
+
+    const nowMs = Date.now();
+    const now = new Date(nowMs);
+
+    const rawToken = await this.dataSource.transaction(async (manager) => {
+      await manager.update(
+        VerificationToken,
+        {
+          user_id: user.id,
+          type: VerificationTokenType.PASSWORD_RESET,
+          used_at: IsNull(),
+        },
+        { used_at: now },
+      );
+
+      return this.createVerificationToken(
+        manager,
+        user.id,
+        VerificationTokenType.PASSWORD_RESET,
+        this.auth.passwordResetTokenExpirationHours,
+        nowMs,
+      );
+    });
+
+    await this.mailService.sendPasswordResetEmail(
+      user.email,
+      user.channel.name,
+      rawToken,
     );
+  }
+
+  async resetPassword(token: string, newPassword: string): Promise<void> {
+    const tokenHash = this.hashToken(token);
+    const nowMs = Date.now();
+    const now = new Date(nowMs);
+
+    const verificationToken = await this.verificationTokenRepository.findOne({
+      where: {
+        token_hash: tokenHash,
+        type: VerificationTokenType.PASSWORD_RESET,
+      },
+    });
+
+    if (!verificationToken || verificationToken.used_at !== null) {
+      throw new InvalidTokenException();
+    }
+
+    if (verificationToken.expires_at.getTime() <= nowMs) {
+      throw new TokenExpiredException();
+    }
+
+    const hashedPassword = await argon2.hash(newPassword);
+
+    await this.dataSource.transaction(async (manager) => {
+      const updateResult = await manager.update(
+        VerificationToken,
+        { id: verificationToken.id, used_at: IsNull() },
+        { used_at: now },
+      );
+
+      if (updateResult.affected === 0) {
+        throw new InvalidTokenException();
+      }
+
+      await this.usersService.updatePassword(
+        verificationToken.user_id,
+        hashedPassword,
+        manager,
+      );
+
+      await this.revokeUserRefreshTokens(
+        verificationToken.user_id,
+        now,
+        manager,
+      );
+    });
+  }
+
+  private async revokeUserRefreshTokens(
+    userId: string,
+    revokedAt: Date,
+    manager?: EntityManager,
+  ): Promise<void> {
+    const criteria = { user_id: userId, revoked_at: IsNull() };
+    const partialEntity = { revoked_at: revokedAt };
+
+    await (manager
+      ? manager.update(RefreshToken, criteria, partialEntity)
+      : this.refreshTokenRepository.update(criteria, partialEntity));
   }
 
   private async handleRevokedRefreshToken(

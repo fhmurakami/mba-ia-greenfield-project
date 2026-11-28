@@ -54,9 +54,12 @@ describe('AuthService (unit)', () => {
       | 'findByEmail'
       | 'findById'
       | 'markEmailConfirmed'
+      | 'updatePassword'
     >
   >;
-  let mailService: jest.Mocked<Pick<MailService, 'sendConfirmationEmail'>>;
+  let mailService: jest.Mocked<
+    Pick<MailService, 'sendConfirmationEmail' | 'sendPasswordResetEmail'>
+  >;
   let refreshTokenRepository: jest.Mocked<
     Pick<Repository<RefreshToken>, 'create' | 'save' | 'findOne' | 'update'>
   >;
@@ -74,9 +77,11 @@ describe('AuthService (unit)', () => {
       findByEmail: jest.fn(),
       findById: jest.fn(),
       markEmailConfirmed: jest.fn(),
+      updatePassword: jest.fn(),
     };
     mailService = {
       sendConfirmationEmail: jest.fn(),
+      sendPasswordResetEmail: jest.fn(),
     };
     refreshTokenRepository = {
       create: jest.fn(),
@@ -149,7 +154,9 @@ describe('AuthService (unit)', () => {
     usersService.findByEmail.mockReset();
     usersService.findById.mockReset();
     usersService.markEmailConfirmed.mockReset();
+    usersService.updatePassword.mockReset();
     mailService.sendConfirmationEmail.mockReset();
+    mailService.sendPasswordResetEmail.mockReset();
     refreshTokenRepository.create.mockReset();
     refreshTokenRepository.save.mockReset();
     refreshTokenRepository.findOne.mockReset();
@@ -161,6 +168,7 @@ describe('AuthService (unit)', () => {
     dataSource.transaction.mockReset();
 
     usersService.markEmailConfirmed.mockResolvedValue(undefined);
+    usersService.updatePassword.mockResolvedValue(undefined);
 
     refreshTokenRepository.create.mockImplementation((entityLike) =>
       Object.assign(new RefreshToken(), entityLike),
@@ -1165,6 +1173,268 @@ describe('AuthService (unit)', () => {
       refreshTokenRepository.update.mockRejectedValueOnce(dbError);
 
       await expect(authService.logout('user-uuid-1')).rejects.toBe(dbError);
+    });
+  });
+
+  describe('forgotPassword', () => {
+    const createUserForReset = (isConfirmed = true): User =>
+      Object.assign(new User(), {
+        id: 'user-uuid-1',
+        email: 'alice@example.com',
+        is_confirmed: isConfirmed,
+        channel: Object.assign(new Channel(), {
+          id: 'channel-uuid-1',
+          name: 'alice',
+          nickname: 'alice',
+        }),
+      });
+
+    it('should normalize email, invalidate unused password_reset tokens, save SHA-256 token, and send reset email', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      usersService.findByEmail.mockResolvedValueOnce(createUserForReset(true));
+      mailService.sendPasswordResetEmail.mockResolvedValueOnce(undefined);
+
+      await authService.forgotPassword('  Alice@Example.com  ');
+
+      expect(usersService.findByEmail).toHaveBeenCalledWith(
+        'alice@example.com',
+      );
+      expect(dataSource.transaction).toHaveBeenCalledTimes(1);
+      expect(entityManager.update).toHaveBeenCalledWith(
+        VerificationToken,
+        {
+          user_id: 'user-uuid-1',
+          type: VerificationTokenType.PASSWORD_RESET,
+          used_at: IsNull(),
+        },
+        { used_at: new Date(fixedNow) },
+      );
+
+      expect(mailService.sendPasswordResetEmail).toHaveBeenCalledTimes(1);
+      const [mailTo, mailName, rawToken] =
+        mailService.sendPasswordResetEmail.mock.calls[0];
+      expect(mailTo).toBe('alice@example.com');
+      expect(mailName).toBe('alice');
+      expect(rawToken).toMatch(/^[a-f0-9]{64}$/);
+
+      expect(verificationTokenRepository.create).toHaveBeenCalledTimes(1);
+      const createResult = verificationTokenRepository.create.mock.results[0];
+      if (createResult.type !== 'return') {
+        throw new Error(
+          'Expected verificationTokenRepository.create to return',
+        );
+      }
+      const createdToken = createResult.value;
+
+      expect(entityManager.save).toHaveBeenCalledWith(
+        VerificationToken,
+        createdToken,
+      );
+      expect(createdToken.token_hash).toBe(
+        createHash('sha256').update(rawToken).digest('hex'),
+      );
+      expect(createdToken.type).toBe(VerificationTokenType.PASSWORD_RESET);
+      expect(createdToken.user_id).toBe('user-uuid-1');
+      expect(createdToken.used_at).toBeNull();
+      expect(createdToken.expires_at).toEqual(
+        new Date(
+          fixedNow +
+            mockAuthConfig.passwordResetTokenExpirationHours * 60 * 60 * 1000,
+        ),
+      );
+    });
+
+    it('should return silently when email is not found', async () => {
+      usersService.findByEmail.mockResolvedValueOnce(null);
+
+      await expect(
+        authService.forgotPassword('unknown@example.com'),
+      ).resolves.toBeUndefined();
+
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+      expect(entityManager.save).not.toHaveBeenCalled();
+      expect(mailService.sendPasswordResetEmail).not.toHaveBeenCalled();
+    });
+
+    it('should send password reset email even when registered user is unconfirmed', async () => {
+      usersService.findByEmail.mockResolvedValueOnce(createUserForReset(false));
+      mailService.sendPasswordResetEmail.mockResolvedValueOnce(undefined);
+
+      await authService.forgotPassword('alice@example.com');
+
+      expect(dataSource.transaction).toHaveBeenCalledTimes(1);
+      expect(mailService.sendPasswordResetEmail).toHaveBeenCalledTimes(1);
+    });
+
+    it('should propagate error when saving new token fails inside transaction without sending email', async () => {
+      usersService.findByEmail.mockResolvedValueOnce(createUserForReset(true));
+      const saveError = new Error('Token save failed');
+      entityManager.save.mockRejectedValueOnce(saveError);
+
+      await expect(
+        authService.forgotPassword('alice@example.com'),
+      ).rejects.toBe(saveError);
+
+      expect(mailService.sendPasswordResetEmail).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('resetPassword', () => {
+    const rawToken = 'b'.repeat(64);
+    const expectedHash = createHash('sha256').update(rawToken).digest('hex');
+
+    it('should validate token, hash new password with Argon2, update password, and revoke refresh tokens atomically', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const tokenRecord = Object.assign(new VerificationToken(), {
+        id: 'token-uuid-1',
+        token_hash: expectedHash,
+        type: VerificationTokenType.PASSWORD_RESET,
+        user_id: 'user-uuid-1',
+        expires_at: new Date(fixedNow + 60_000),
+        used_at: null,
+      });
+      verificationTokenRepository.findOne.mockResolvedValueOnce(tokenRecord);
+
+      await authService.resetPassword(rawToken, 'NewStrongPassword456');
+
+      expect(verificationTokenRepository.findOne).toHaveBeenCalledWith({
+        where: {
+          token_hash: expectedHash,
+          type: VerificationTokenType.PASSWORD_RESET,
+        },
+      });
+      expect(dataSource.transaction).toHaveBeenCalledTimes(1);
+      expect(entityManager.update).toHaveBeenNthCalledWith(
+        1,
+        VerificationToken,
+        { id: 'token-uuid-1', used_at: IsNull() },
+        { used_at: new Date(fixedNow) },
+      );
+      expect(usersService.updatePassword).toHaveBeenCalledTimes(1);
+      const [updatedUserId, hashedPassword, passedManager] =
+        usersService.updatePassword.mock.calls[0];
+      expect(updatedUserId).toBe('user-uuid-1');
+      expect(hashedPassword).not.toBe('NewStrongPassword456');
+      expect(await argon2.verify(hashedPassword, 'NewStrongPassword456')).toBe(
+        true,
+      );
+      expect(passedManager).toBe(entityManager);
+
+      expect(entityManager.update).toHaveBeenNthCalledWith(
+        2,
+        RefreshToken,
+        { user_id: 'user-uuid-1', revoked_at: IsNull() },
+        { revoked_at: new Date(fixedNow) },
+      );
+    });
+
+    it('should throw InvalidTokenException when token is not found', async () => {
+      verificationTokenRepository.findOne.mockResolvedValueOnce(null);
+
+      await expect(
+        authService.resetPassword(rawToken, 'NewStrongPassword456'),
+      ).rejects.toThrow(InvalidTokenException);
+
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+      expect(usersService.updatePassword).not.toHaveBeenCalled();
+    });
+
+    it('should throw InvalidTokenException when token was already used even if also expired', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const usedToken = Object.assign(new VerificationToken(), {
+        id: 'token-uuid-1',
+        token_hash: expectedHash,
+        type: VerificationTokenType.PASSWORD_RESET,
+        user_id: 'user-uuid-1',
+        expires_at: new Date(fixedNow - 60_000),
+        used_at: new Date(fixedNow - 120_000),
+      });
+      verificationTokenRepository.findOne.mockResolvedValueOnce(usedToken);
+
+      await expect(
+        authService.resetPassword(rawToken, 'NewStrongPassword456'),
+      ).rejects.toThrow(InvalidTokenException);
+
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+      expect(usersService.updatePassword).not.toHaveBeenCalled();
+    });
+
+    it('should throw TokenExpiredException when unused token is expired at boundary', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const expiredToken = Object.assign(new VerificationToken(), {
+        id: 'token-uuid-1',
+        token_hash: expectedHash,
+        type: VerificationTokenType.PASSWORD_RESET,
+        user_id: 'user-uuid-1',
+        expires_at: new Date(fixedNow),
+        used_at: null,
+      });
+      verificationTokenRepository.findOne.mockResolvedValueOnce(expiredToken);
+
+      await expect(
+        authService.resetPassword(rawToken, 'NewStrongPassword456'),
+      ).rejects.toThrow(TokenExpiredException);
+
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+      expect(usersService.updatePassword).not.toHaveBeenCalled();
+    });
+
+    it('should throw InvalidTokenException on concurrent consumption without updating password or revoking tokens', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const tokenRecord = Object.assign(new VerificationToken(), {
+        id: 'token-uuid-1',
+        token_hash: expectedHash,
+        type: VerificationTokenType.PASSWORD_RESET,
+        user_id: 'user-uuid-1',
+        expires_at: new Date(fixedNow + 60_000),
+        used_at: null,
+      });
+      verificationTokenRepository.findOne.mockResolvedValueOnce(tokenRecord);
+      entityManager.update.mockResolvedValueOnce({
+        affected: 0,
+        raw: [],
+        generatedMaps: [],
+      } satisfies UpdateResult);
+
+      await expect(
+        authService.resetPassword(rawToken, 'NewStrongPassword456'),
+      ).rejects.toThrow(InvalidTokenException);
+
+      expect(entityManager.update).toHaveBeenCalledTimes(1);
+      expect(usersService.updatePassword).not.toHaveBeenCalled();
+    });
+
+    it('should propagate error when updatePassword fails inside transaction without revoking refresh tokens', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const tokenRecord = Object.assign(new VerificationToken(), {
+        id: 'token-uuid-1',
+        token_hash: expectedHash,
+        type: VerificationTokenType.PASSWORD_RESET,
+        user_id: 'user-uuid-1',
+        expires_at: new Date(fixedNow + 60_000),
+        used_at: null,
+      });
+      verificationTokenRepository.findOne.mockResolvedValueOnce(tokenRecord);
+      const updateError = new Error('Password update failed');
+      usersService.updatePassword.mockRejectedValueOnce(updateError);
+
+      await expect(
+        authService.resetPassword(rawToken, 'NewStrongPassword456'),
+      ).rejects.toBe(updateError);
+
+      expect(entityManager.update).toHaveBeenCalledTimes(1);
     });
   });
 });

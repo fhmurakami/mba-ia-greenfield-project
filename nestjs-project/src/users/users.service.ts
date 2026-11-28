@@ -145,4 +145,17 @@ export class UsersService {
       ? manager.update(User, { id: userId }, { is_confirmed: true })
       : this.userRepository.update({ id: userId }, { is_confirmed: true }));
   }
+
+  async updatePassword(
+    userId: string,
+    hashedPassword: string,
+    manager?: EntityManager,
+  ): Promise<void> {
+    await (manager
+      ? manager.update(User, { id: userId }, { password: hashedPassword })
+      : this.userRepository.update(
+          { id: userId },
+          { password: hashedPassword },
+        ));
+  }
 }

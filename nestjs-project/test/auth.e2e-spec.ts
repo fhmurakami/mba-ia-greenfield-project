@@ -13,7 +13,10 @@ import { AppModule } from '../src/app.module';
 import type { JwtPayload } from '../src/auth/auth.types';
 import { CurrentUser } from '../src/auth/decorators/current-user.decorator';
 import { RefreshToken } from '../src/auth/entities/refresh-token.entity';
-import { VerificationToken } from '../src/auth/entities/verification-token.entity';
+import {
+  VerificationToken,
+  VerificationTokenType,
+} from '../src/auth/entities/verification-token.entity';
 import { DomainExceptionFilter } from '../src/common/filters/domain-exception.filter';
 import { ValidationExceptionFilter } from '../src/common/filters/validation-exception.filter';
 import { MAIL_SUBJECTS } from '../src/mail/mail.constants';
@@ -112,6 +115,20 @@ describe('AuthController (e2e)', () => {
       messages[0].ID,
     )) as MailpitMessageDetail;
     const match = /\/auth\/confirm-email\?token=([a-f0-9]{64})/.exec(
+      detail.HTML,
+    );
+    expect(match).not.toBeNull();
+    return match![1];
+  };
+
+  const extractPasswordResetToken = async (): Promise<string> => {
+    const messages = (await getMailpitMessages()) as MailpitMessageSummary[];
+    expect(messages.length).toBeGreaterThan(0);
+
+    const detail = (await getMailpitMessage(
+      messages[0].ID,
+    )) as MailpitMessageDetail;
+    const match = /\/auth\/reset-password\?token=([a-f0-9]{64})/.exec(
       detail.HTML,
     );
     expect(match).not.toBeNull();
@@ -1242,6 +1259,386 @@ describe('AuthController (e2e)', () => {
       const body = userBRefreshRes.body as LoginResponseBody;
       expect(typeof body.access_token).toBe('string');
       expect(typeof body.refresh_token).toBe('string');
+    });
+  });
+
+  describe('POST /auth/forgot-password', () => {
+    it('should return 204 and deliver password reset email with channel name and reset link', async () => {
+      await registerAndGetToken('forgot-e2e@example.com');
+      await clearMailpitMessages();
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'Forgot-E2E@Example.com' })
+        .expect(204);
+
+      expect(response.text).toBe('');
+
+      const messages = (await getMailpitMessages()) as MailpitMessageSummary[];
+      expect(messages).toHaveLength(1);
+      expect(messages[0].To[0].Address).toBe('forgot-e2e@example.com');
+      expect(messages[0].Subject).toBe(MAIL_SUBJECTS.PASSWORD_RESET);
+
+      const detail = (await getMailpitMessage(
+        messages[0].ID,
+      )) as MailpitMessageDetail;
+      expect(detail.HTML).toContain('forgote2e');
+      expect(detail.HTML).toMatch(/\/auth\/reset-password\?token=[a-f0-9]{64}/);
+    });
+
+    it('should return 204 without sending email when email is not registered', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'unknown-forgot@example.com' })
+        .expect(204);
+
+      expect(response.text).toBe('');
+      expect(await getMailpitMessages()).toHaveLength(0);
+    });
+
+    it('should invalidate previous unused reset token when requesting a new password reset', async () => {
+      await registerAndGetToken('forgot-rotate@example.com');
+      await clearMailpitMessages();
+
+      await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'forgot-rotate@example.com' })
+        .expect(204);
+      const oldToken = await extractPasswordResetToken();
+      await clearMailpitMessages();
+
+      await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'forgot-rotate@example.com' })
+        .expect(204);
+      const newToken = await extractPasswordResetToken();
+      expect(newToken).not.toBe(oldToken);
+
+      const oldTokenRes = await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token: oldToken, new_password: 'NewStrongPassword456' })
+        .expect(401);
+      expect(oldTokenRes.body as ErrorResponseBody).toEqual({
+        statusCode: 401,
+        error: 'INVALID_TOKEN',
+        message: 'Invalid or already used token',
+      });
+
+      await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token: newToken, new_password: 'NewStrongPassword456' })
+        .expect(204);
+    });
+
+    it('should return 400 VALIDATION_ERROR when email format is invalid', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'not-an-email' })
+        .expect(400);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body.statusCode).toBe(400);
+      expect(body.error).toBe('VALIDATION_ERROR');
+      expect(body.message).toEqual(
+        expect.arrayContaining(['email must be an email']),
+      );
+    });
+  });
+
+  describe('POST /auth/reset-password', () => {
+    const registerConfirmAndLogin = async (
+      email: string,
+    ): Promise<{
+      userId: string;
+      access_token: string;
+      refresh_token: string;
+    }> => {
+      const { userId, token } = await registerAndGetToken(email);
+      await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({ token })
+        .expect(204);
+
+      const loginResponse = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email,
+          password: 'StrongPassword123',
+        })
+        .expect(200);
+      await clearMailpitMessages();
+
+      const tokens = loginResponse.body as LoginResponseBody;
+      return {
+        userId,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+      };
+    };
+
+    it('should return 204 with empty body, allow login with new password, and reject old password with 401 INVALID_CREDENTIALS', async () => {
+      await registerConfirmAndLogin('reset-e2e@example.com');
+
+      await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'reset-e2e@example.com' })
+        .expect(204);
+      const resetToken = await extractPasswordResetToken();
+
+      const resetRes = await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token: resetToken, new_password: 'NewStrongPassword456' })
+        .expect(204);
+      expect(resetRes.text).toBe('');
+
+      const oldPasswordRes = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'reset-e2e@example.com',
+          password: 'StrongPassword123',
+        })
+        .expect(401);
+      expect(oldPasswordRes.body as ErrorResponseBody).toEqual({
+        statusCode: 401,
+        error: 'INVALID_CREDENTIALS',
+        message: 'Invalid email or password',
+      });
+
+      const newPasswordRes = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'reset-e2e@example.com',
+          password: 'NewStrongPassword456',
+        })
+        .expect(200);
+      expect(
+        typeof (newPasswordRes.body as LoginResponseBody).access_token,
+      ).toBe('string');
+    });
+
+    it('should revoke all refresh tokens (including rotated families) and return 401 INVALID_TOKEN within 10s grace period', async () => {
+      const { refresh_token: initialRefreshToken } =
+        await registerConfirmAndLogin('reset-grace-e2e@example.com');
+
+      const rotateRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: initialRefreshToken })
+        .expect(200);
+      const rotatedRefreshToken = (rotateRes.body as LoginResponseBody)
+        .refresh_token;
+
+      await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'reset-grace-e2e@example.com' })
+        .expect(204);
+      const resetToken = await extractPasswordResetToken();
+
+      await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token: resetToken, new_password: 'NewStrongPassword456' })
+        .expect(204);
+
+      const initialRefreshRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: initialRefreshToken })
+        .expect(401);
+      expect(initialRefreshRes.body as ErrorResponseBody).toEqual({
+        statusCode: 401,
+        error: 'INVALID_TOKEN',
+        message: 'Invalid or already used token',
+      });
+
+      const rotatedRefreshRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: rotatedRefreshToken })
+        .expect(401);
+      expect(rotatedRefreshRes.body as ErrorResponseBody).toEqual({
+        statusCode: 401,
+        error: 'INVALID_TOKEN',
+        message: 'Invalid or already used token',
+      });
+    });
+
+    it('should return 401 TOKEN_REUSE_DETECTED when refreshing a reset-revoked token beyond 10s grace period', async () => {
+      const { userId, refresh_token } = await registerConfirmAndLogin(
+        'reset-reuse-grace-e2e@example.com',
+      );
+
+      await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'reset-reuse-grace-e2e@example.com' })
+        .expect(204);
+      const resetToken = await extractPasswordResetToken();
+
+      await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token: resetToken, new_password: 'NewStrongPassword456' })
+        .expect(204);
+
+      await dataSource
+        .getRepository(RefreshToken)
+        .update(
+          { user_id: userId },
+          { revoked_at: new Date(Date.now() - 11_000) },
+        );
+
+      const refreshBeyondGraceRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token })
+        .expect(401);
+      expect(refreshBeyondGraceRes.body as ErrorResponseBody).toEqual({
+        statusCode: 401,
+        error: 'TOKEN_REUSE_DETECTED',
+        message: 'Token reuse detected — all sessions revoked',
+      });
+    });
+
+    it('should allow POST /auth/forgot-password and POST /auth/reset-password even when an expired Authorization Bearer header is attached', async () => {
+      const { userId } = await registerConfirmAndLogin(
+        'reset-public-bearer-e2e@example.com',
+      );
+      const expiredAccessToken = jwtService.sign(
+        { sub: userId, email: 'reset-public-bearer-e2e@example.com' },
+        { expiresIn: '-1s' },
+      );
+
+      await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .set('Authorization', `Bearer ${expiredAccessToken}`)
+        .send({ email: 'reset-public-bearer-e2e@example.com' })
+        .expect(204);
+      const resetToken = await extractPasswordResetToken();
+
+      await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .set('Authorization', `Bearer ${expiredAccessToken}`)
+        .send({ token: resetToken, new_password: 'NewStrongPassword456' })
+        .expect(204);
+    });
+
+    it('should return 401 INVALID_TOKEN when token does not exist', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({
+          token: '0'.repeat(64),
+          new_password: 'NewStrongPassword456',
+        })
+        .expect(401);
+
+      expect(response.body as ErrorResponseBody).toEqual({
+        statusCode: 401,
+        error: 'INVALID_TOKEN',
+        message: 'Invalid or already used token',
+      });
+    });
+
+    it('should return 401 INVALID_TOKEN when token has already been used', async () => {
+      await registerAndGetToken('reset-used-e2e@example.com');
+      await clearMailpitMessages();
+
+      await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'reset-used-e2e@example.com' })
+        .expect(204);
+      const resetToken = await extractPasswordResetToken();
+
+      await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token: resetToken, new_password: 'NewStrongPassword456' })
+        .expect(204);
+
+      const secondRes = await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token: resetToken, new_password: 'AnotherPassword789' })
+        .expect(401);
+
+      expect(secondRes.body as ErrorResponseBody).toEqual({
+        statusCode: 401,
+        error: 'INVALID_TOKEN',
+        message: 'Invalid or already used token',
+      });
+    });
+
+    it('should return 401 TOKEN_EXPIRED when token has expired', async () => {
+      const { userId } = await registerAndGetToken(
+        'reset-expired-e2e@example.com',
+      );
+      await clearMailpitMessages();
+
+      await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'reset-expired-e2e@example.com' })
+        .expect(204);
+      const resetToken = await extractPasswordResetToken();
+
+      await dataSource
+        .getRepository(VerificationToken)
+        .update(
+          { user_id: userId, type: VerificationTokenType.PASSWORD_RESET },
+          { expires_at: new Date(Date.now() - 60_000) },
+        );
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token: resetToken, new_password: 'NewStrongPassword456' })
+        .expect(401);
+
+      expect(response.body as ErrorResponseBody).toEqual({
+        statusCode: 401,
+        error: 'TOKEN_EXPIRED',
+        message: 'Token has expired',
+      });
+    });
+
+    it('should return 400 VALIDATION_ERROR for invalid payload fields', async () => {
+      const emptyRes = await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token: '', new_password: 'short' })
+        .expect(400);
+
+      const emptyBody = emptyRes.body as ErrorResponseBody;
+      expect(emptyBody.statusCode).toBe(400);
+      expect(emptyBody.error).toBe('VALIDATION_ERROR');
+      expect(emptyBody.message).toEqual(
+        expect.arrayContaining([
+          'token should not be empty',
+          'new_password must be longer than or equal to 8 characters',
+        ]),
+      );
+
+      const missingTokenRes = await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ new_password: 'NewStrongPassword456' })
+        .expect(400);
+
+      const missingTokenBody = missingTokenRes.body as ErrorResponseBody;
+      expect(missingTokenBody.statusCode).toBe(400);
+      expect(missingTokenBody.error).toBe('VALIDATION_ERROR');
+      expect(missingTokenBody.message).toEqual(
+        expect.arrayContaining([
+          'token should not be empty',
+          'token must be a string',
+        ]),
+      );
+
+      const longPasswordRes = await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({
+          token: 'valid-token',
+          new_password: 'a'.repeat(129),
+          extraField: 'nope',
+        })
+        .expect(400);
+
+      const longPasswordBody = longPasswordRes.body as ErrorResponseBody;
+      expect(longPasswordBody.statusCode).toBe(400);
+      expect(longPasswordBody.error).toBe('VALIDATION_ERROR');
+      expect(longPasswordBody.message).toEqual(
+        expect.arrayContaining([
+          'new_password must be shorter than or equal to 128 characters',
+          'property extraField should not exist',
+        ]),
+      );
     });
   });
 });

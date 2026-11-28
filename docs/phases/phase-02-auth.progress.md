@@ -1,7 +1,7 @@
 # Phase 02 — Cadastro, Login e Gerenciamento de Conta — Progress
 
 **Status:** in_progress
-**SIs:** 11/13 completed
+**SIs:** 12/13 completed
 
 ### SI-02.1 — Dependencies, Configuration Namespaces, and Docker Compose
 
@@ -71,9 +71,9 @@
 
 ### SI-02.12 — Password Reset (Request and Execute)
 
-- **Status:** pending
-- **Tests:** pending
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 5 suites passed (174 tests)
+- **Observations:** Implemented `ForgotPasswordDto`, `ResetPasswordDto`, `UsersService.updatePassword(userId, hashedPassword, manager?)` (preserving `UsersModule` encapsulation), `AuthService.forgotPassword`, `AuthService.resetPassword`, shared private `AuthService.revokeUserRefreshTokens` (reused by `logout` and `resetPassword`), and `@Public() @Post('forgot-password')` + `@Public() @Post('reset-password')` (`204 No Content`) in `AuthController`. `forgotPassword` normalizes email via `trim().toLowerCase()`, returns silently for unknown emails, invalidates prior unused `password_reset` tokens without affecting `email_confirmation` tokens, and sends the reset email outside the transaction. `resetPassword` validates existence/unused (`InvalidTokenException`) before expiration (`TokenExpiredException`), hashes with Argon2 before opening `dataSource.transaction(...)`, atomically marks the token used (`used_at: IsNull()`), updates the password, and revokes all active refresh tokens. Compared against commit `102d7813`, kept transactional atomicity and conditional `used_at: IsNull()` concurrency guard, `UsersService.updatePassword` encapsulation, email normalization, `IsNull()` updates without `as any`, and real Mailpit verification; split and expanded `SI-02.12` integration and E2E tests for single-scenario isolation, post-reset login, rotated-family grace-cache rejection, unknown/wrong-type tokens, `@Public()` stale-Bearer access, missing `token` validation, and rollback password preservation. Context7 verification: `argon2@^0.41.1` exact `v0.41.1` docs, `typeorm@0.3.31` exact `0.3.31` docs (`IsNull()`, `EntityManager.update`), and `class-validator@^0.14.4` served closest `v0.15.1` docs (`@IsEmail`, `@IsString`, `@IsNotEmpty`, `@MinLength`, `@MaxLength` — identical decorator signatures and default messages).
 
 ### SI-02.13 — Rate Limiting on Auth Endpoints
 
@@ -93,3 +93,5 @@
 - [ ] Move AuthService's 10-second refresh-token grace-period cache (`rotatedTokenGraceCache`) from an in-memory `Map` to a shared distributed cache (e.g., Redis) if `nestjs-api` is scaled horizontally across multiple replicas.
 - [ ] Add a scheduled maintenance job to prune expired `refresh_tokens` and `verification_tokens` rows past their audit/reuse-detection retention window so token tables do not grow unbounded.
 - [ ] Evaluate immediate access-token invalidation on logout and password reset (e.g., short-TTL Redis jti denylist or per-user tokens_valid_after timestamp checked in JwtAuthGuard) if stateless JWT access-token validity up to JWT_ACCESS_EXPIRATION is unacceptable for sensitive operations.
+- [ ] Extract shared transactional verification-token helpers in `AuthService` (lookup/expiration validation by `VerificationTokenType`, conditional `used_at` consumption, and prior-token invalidation + replacement) to deduplicate `confirm`/`resendConfirmation` (`SI-02.7`) and `resetPassword`/`forgotPassword` (`SI-02.12`).
+- [ ] Dispatch confirmation and password-reset emails asynchronously via a background job queue (decoupling HTTP response latency from SMTP delivery and mitigating response-time user enumeration on `forgot-password` and `resend-confirmation`).
