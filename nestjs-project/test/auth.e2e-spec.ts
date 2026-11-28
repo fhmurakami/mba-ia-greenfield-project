@@ -1,9 +1,4 @@
-import {
-  Controller,
-  Get,
-  INestApplication,
-  ValidationPipe,
-} from '@nestjs/common';
+import { Controller, Get, INestApplication } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import {
   getStorageToken,
@@ -24,8 +19,7 @@ import {
   VerificationToken,
   VerificationTokenType,
 } from '../src/auth/entities/verification-token.entity';
-import { DomainExceptionFilter } from '../src/common/filters/domain-exception.filter';
-import { ValidationExceptionFilter } from '../src/common/filters/validation-exception.filter';
+import { configureApp } from '../src/common/configure-app';
 import { MAIL_SUBJECTS } from '../src/mail/mail.constants';
 import { Channel } from '../src/users/entities/channel.entity';
 import { User } from '../src/users/entities/user.entity';
@@ -90,17 +84,7 @@ describe('AuthController (e2e)', () => {
     }).compile();
 
     app = moduleFixture.createNestApplication();
-    app.useGlobalPipes(
-      new ValidationPipe({
-        whitelist: true,
-        forbidNonWhitelisted: true,
-        transform: true,
-      }),
-    );
-    app.useGlobalFilters(
-      new DomainExceptionFilter(),
-      new ValidationExceptionFilter(),
-    );
+    configureApp(app);
 
     await app.init();
     dataSource = app.get(DataSource);
