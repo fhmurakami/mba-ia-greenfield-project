@@ -250,4 +250,28 @@ describe('UsersService (integration)', () => {
       expect(persistedUser?.is_confirmed).toBe(false);
     });
   });
+
+  describe('findById', () => {
+    it('should return persisted user without password when found by id', async () => {
+      const created = await usersService.createUserWithChannel(
+        'find-by-id@example.com',
+        'hashed-password',
+      );
+
+      const found = await usersService.findById(created.id);
+
+      expect(found).not.toBeNull();
+      expect(found?.id).toBe(created.id);
+      expect(found?.email).toBe('find-by-id@example.com');
+      expect(found?.password).toBeUndefined();
+    });
+
+    it('should return null when user id does not exist', async () => {
+      const found = await usersService.findById(
+        '00000000-0000-0000-0000-000000000000',
+      );
+
+      expect(found).toBeNull();
+    });
+  });
 });

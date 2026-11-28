@@ -1,7 +1,7 @@
 # Phase 02 — Cadastro, Login e Gerenciamento de Conta — Progress
 
 **Status:** in_progress
-**SIs:** 9/13 completed
+**SIs:** 10/13 completed
 
 ### SI-02.1 — Dependencies, Configuration Namespaces, and Docker Compose
 
@@ -59,9 +59,9 @@
 
 ### SI-02.10 — Refresh Token Rotation
 
-- **Status:** pending
-- **Tests:** pending
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 4 suites passed (110 tests)
+- **Observations:** Implemented `RefreshTokenDto`, `UsersService.findById`, `REFRESH_GRACE_PERIOD_MS` (`10_000`) in `auth.constants.ts`, `AuthService.refresh` with shared `signAccessToken`/`buildRefreshToken` helpers, and `@Public() @Post('refresh')` (`200 OK`) in `AuthController`. `refresh` hashes the incoming token with SHA-256, validates persistence, expiration, and JWT signature/claims (`sub`, `family`) against `jwtRefreshSecret`, atomically revokes the active token and persists a new token in the same `family` inside `dataSource.transaction()`, handles concurrent rotation races (`affected === 0`) and 10s grace-period retries via `rotatedTokenGraceCache` without creating extra rows or revoking the family, and commits full family revocation outside any throwing transaction before throwing `TokenReuseDetectedException` when reuse occurs past 10s. Compared against commit `9ad00f0c`, preserved transactional rotation, active-family validation during the grace window, active-token grace cache, JWT verification, and `UsersService` encapsulation, and added unit/integration/E2E coverage for grace-period expiry, cache eviction on rollback, DB transaction rollback, unknown token lookup, and `@Public()` refresh with an expired `Authorization` header. Context7 verification: `typeorm@0.3.31` exact docs (`findOne`, `IsNull()`, `EntityManager.update`, `dataSource.transaction`), `@nestjs/jwt@^11.0.2` exact `11.0.2` docs (`JwtService.sign`/`verify`/`decode`), and `class-validator@^0.14.4` served closest `v0.15.1` (`@IsString`, `@IsNotEmpty`).
 
 ### SI-02.11 — Logout and Session Revocation
 
@@ -88,5 +88,7 @@
 - [ ] Extract duplicated email normalization (`email.trim().toLowerCase()`) between `UsersService` and `AuthService` into a shared utility helper.
 - [ ] Adopt `JwtPayload` (and a typed `RefreshTokenPayload`) from `src/auth/auth.types.ts` in `AuthService` token signing/decoding and login E2E assertions so JWT payload contracts share a single source of truth.
 - [ ] Evaluate whether an authenticated session-inspection endpoint (e.g., `GET /auth/me` as in reference commit `c927802`, or `GET /users/me` in Phase 03) should be formally added to the API contract with an explicit rate-limit policy.
-- [ ] Hoist and deduplicate shared E2E auth setup helpers (`registerAndConfirmUser` / `registerConfirmAndLogin`, keeping real Mailpit token extraction) across `describe` blocks in `test/auth.e2e-spec.ts`.
+- [ ] Hoist and deduplicate shared E2E/integration auth setup helpers (`registerAndConfirmUser` / `registerConfirmAndLogin`, keeping real Mailpit token extraction) across `describe` blocks in `src/auth/auth.service.integration-spec.ts` and `test/auth.e2e-spec.ts`.
 - [ ] Evaluate a global `HttpException` filter to normalize framework error codes (e.g., `UnauthorizedException` -> `UNAUTHORIZED`, `ThrottlerException` -> `TOO_MANY_REQUESTS`) to `UPPER_SNAKE_CASE` alongside `DomainExceptionFilter` and `ValidationExceptionFilter`.
+- [ ] Move AuthService's 10-second refresh-token grace-period cache (`rotatedTokenGraceCache`) from an in-memory `Map` to a shared distributed cache (e.g., Redis) if `nestjs-api` is scaled horizontally across multiple replicas.
+- [ ] Add a scheduled maintenance job to prune expired `refresh_tokens` and `verification_tokens` rows past their audit/reuse-detection retention window so token tables do not grow unbounded.

@@ -20,6 +20,7 @@ import {
   InvalidCredentialsException,
   InvalidTokenException,
   TokenExpiredException,
+  TokenReuseDetectedException,
 } from '../common/exceptions/domain.exception';
 import appConfig from '../config/app.config';
 import authConfig from '../config/auth.config';
@@ -574,6 +575,215 @@ describe('AuthService (integration)', () => {
       ).rejects.toThrow(EmailNotConfirmedException);
 
       expect(await refreshTokenRepository.count()).toBe(0);
+    });
+  });
+
+  describe('refresh', () => {
+    const registerConfirmAndLogin = async (
+      email: string,
+    ): Promise<{
+      userId: string;
+      access_token: string;
+      refresh_token: string;
+    }> => {
+      const registered = await authService.register({
+        email,
+        password: 'MySecretPassword123',
+      });
+      const rawToken = await extractConfirmationTokenFromLatestEmail();
+      await authService.confirm(rawToken);
+      const tokens = await authService.login({
+        email,
+        password: 'MySecretPassword123',
+      });
+      return {
+        userId: registered.id,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+      };
+    };
+
+    it('should rotate refresh token in database, preserve family, and allow chaining next refresh', async () => {
+      const { userId, refresh_token: token1 } = await registerConfirmAndLogin(
+        'refresh-int@example.com',
+      );
+
+      const rotated1 = await authService.refresh(token1);
+      expect(rotated1.refresh_token).not.toBe(token1);
+
+      const payload1 = jwtService.verify<{ family: string }>(token1, {
+        secret: authCfg.jwtRefreshSecret,
+      });
+      const payload2 = jwtService.verify<{ family: string }>(
+        rotated1.refresh_token,
+        { secret: authCfg.jwtRefreshSecret },
+      );
+      expect(payload2.family).toBe(payload1.family);
+
+      const accessPayload = jwtService.verify<{ sub: string; email: string }>(
+        rotated1.access_token,
+      );
+      expect(accessPayload.sub).toBe(userId);
+      expect(accessPayload.email).toBe('refresh-int@example.com');
+
+      const tokensAfterFirst = await refreshTokenRepository.find({
+        where: { user_id: userId },
+        order: { created_at: 'ASC' },
+      });
+      expect(tokensAfterFirst).toHaveLength(2);
+      expect(tokensAfterFirst[0].revoked_at).toBeInstanceOf(Date);
+      expect(tokensAfterFirst[1].revoked_at).toBeNull();
+      expect(tokensAfterFirst[1].token_hash).toBe(
+        createHash('sha256').update(rotated1.refresh_token).digest('hex'),
+      );
+
+      const rotated2 = await authService.refresh(rotated1.refresh_token);
+      expect(rotated2.refresh_token).not.toBe(rotated1.refresh_token);
+      expect(
+        await refreshTokenRepository.count({ where: { user_id: userId } }),
+      ).toBe(3);
+    });
+
+    it('should throw TokenExpiredException when refresh token is expired in database', async () => {
+      const { userId, refresh_token } = await registerConfirmAndLogin(
+        'refresh-expired-int@example.com',
+      );
+
+      await refreshTokenRepository.update(
+        { user_id: userId },
+        { expires_at: new Date(Date.now() - 60_000) },
+      );
+
+      await expect(authService.refresh(refresh_token)).rejects.toThrow(
+        TokenExpiredException,
+      );
+
+      const stored = await refreshTokenRepository.findOneBy({
+        user_id: userId,
+      });
+      expect(stored?.revoked_at).toBeNull();
+    });
+
+    it('should return active refresh token within 10s grace period without creating extra rows or revoking family', async () => {
+      const { userId, refresh_token: token1 } = await registerConfirmAndLogin(
+        'refresh-grace-int@example.com',
+      );
+
+      const rotated1 = await authService.refresh(token1);
+      const graceResult = await authService.refresh(token1);
+
+      expect(graceResult.refresh_token).toBe(rotated1.refresh_token);
+      expect(
+        jwtService.verify<{ sub: string }>(graceResult.access_token).sub,
+      ).toBe(userId);
+
+      const tokens = await refreshTokenRepository.find({
+        where: { user_id: userId },
+        order: { created_at: 'ASC' },
+      });
+      expect(tokens).toHaveLength(2);
+      expect(tokens[1].revoked_at).toBeNull();
+
+      await expect(
+        authService.refresh(rotated1.refresh_token),
+      ).resolves.toBeDefined();
+    });
+
+    it('should handle concurrent refresh calls safely with exactly one new token persisted', async () => {
+      const { userId, refresh_token: token1 } = await registerConfirmAndLogin(
+        'refresh-concurrent-int@example.com',
+      );
+
+      const [resA, resB] = await Promise.all([
+        authService.refresh(token1),
+        authService.refresh(token1),
+      ]);
+
+      expect(resA.refresh_token).toBe(resB.refresh_token);
+
+      const tokens = await refreshTokenRepository.find({
+        where: { user_id: userId },
+      });
+      expect(tokens).toHaveLength(2);
+      expect(tokens.filter((t) => t.revoked_at === null)).toHaveLength(1);
+    });
+
+    it('should persist family revocation when token is reused beyond 10s grace period without affecting other families', async () => {
+      const { userId, refresh_token: familyAToken1 } =
+        await registerConfirmAndLogin('refresh-reuse-int@example.com');
+      const otherLogin = await authService.login({
+        email: 'refresh-reuse-int@example.com',
+        password: 'MySecretPassword123',
+      });
+
+      await authService.refresh(familyAToken1);
+
+      const familyAHash1 = createHash('sha256')
+        .update(familyAToken1)
+        .digest('hex');
+      await refreshTokenRepository.update(
+        { token_hash: familyAHash1 },
+        { revoked_at: new Date(Date.now() - 11_000) },
+      );
+
+      await expect(authService.refresh(familyAToken1)).rejects.toThrow(
+        TokenReuseDetectedException,
+      );
+
+      const familyADecoded = jwtService.verify<{ family: string }>(
+        familyAToken1,
+        { secret: authCfg.jwtRefreshSecret },
+      );
+      const familyBDecoded = jwtService.verify<{ family: string }>(
+        otherLogin.refresh_token,
+        { secret: authCfg.jwtRefreshSecret },
+      );
+
+      const familyATokens = await refreshTokenRepository.find({
+        where: { user_id: userId, family: familyADecoded.family },
+      });
+      expect(familyATokens).toHaveLength(2);
+      expect(
+        familyATokens.every((token) => token.revoked_at instanceof Date),
+      ).toBe(true);
+
+      const familyBTokens = await refreshTokenRepository.find({
+        where: { user_id: userId, family: familyBDecoded.family },
+      });
+      expect(familyBTokens).toHaveLength(1);
+      expect(familyBTokens[0].revoked_at).toBeNull();
+    });
+
+    it('should throw InvalidTokenException when refresh token is not found in database', async () => {
+      await expect(
+        authService.refresh('unknown-refresh-token'),
+      ).rejects.toThrow(InvalidTokenException);
+    });
+
+    it('should roll back old token revocation when saving new refresh token fails inside transaction', async () => {
+      const { userId, refresh_token: token1 } = await registerConfirmAndLogin(
+        'refresh-rollback-int@example.com',
+      );
+
+      const invalidNewToken = Object.assign(new RefreshToken(), {
+        token_hash: 'failed-hash',
+        family: '00000000-0000-0000-0000-000000000000',
+        user_id: '00000000-0000-0000-0000-000000000000',
+        expires_at: new Date(Date.now() + 60_000),
+        revoked_at: null,
+      });
+
+      jest
+        .spyOn(refreshTokenRepository, 'create')
+        .mockReturnValueOnce(invalidNewToken);
+
+      await expect(authService.refresh(token1)).rejects.toThrow();
+
+      const storedTokens = await refreshTokenRepository.find({
+        where: { user_id: userId },
+      });
+      expect(storedTokens).toHaveLength(1);
+      expect(storedTokens[0].revoked_at).toBeNull();
     });
   });
 });

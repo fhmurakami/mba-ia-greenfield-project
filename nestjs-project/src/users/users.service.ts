@@ -133,6 +133,10 @@ export class UsersService {
       .getOne();
   }
 
+  async findById(id: string): Promise<User | null> {
+    return this.userRepository.findOneBy({ id });
+  }
+
   async markEmailConfirmed(
     userId: string,
     manager?: EntityManager,

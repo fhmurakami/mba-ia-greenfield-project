@@ -11,10 +11,12 @@ import {
   InvalidCredentialsException,
   InvalidTokenException,
   TokenExpiredException,
+  TokenReuseDetectedException,
 } from '../common/exceptions/domain.exception';
 import authConfig from '../config/auth.config';
 import { MailService } from '../mail/mail.service';
 import { UsersService } from '../users/users.service';
+import { REFRESH_GRACE_PERIOD_MS } from './auth.constants';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { RefreshToken } from './entities/refresh-token.entity';
@@ -25,6 +27,11 @@ import {
 
 @Injectable()
 export class AuthService {
+  private readonly rotatedTokenGraceCache = new Map<
+    string,
+    { rawToken: string; expiresAtMs: number }
+  >();
+
   constructor(
     private readonly usersService: UsersService,
     private readonly mailService: MailService,
@@ -171,17 +178,157 @@ export class AuthService {
       throw new EmailNotConfirmedException();
     }
 
-    const accessToken = this.jwtService.sign(
-      { sub: user.id, email: user.email },
+    const accessToken = this.signAccessToken(user.id, user.email);
+    const { rawToken: refreshToken, entity: refreshTokenEntity } =
+      this.buildRefreshToken(user.id, randomUUID());
+    await this.refreshTokenRepository.save(refreshTokenEntity);
+
+    return {
+      access_token: accessToken,
+      refresh_token: refreshToken,
+    };
+  }
+
+  async refresh(
+    rawToken: string,
+  ): Promise<{ access_token: string; refresh_token: string }> {
+    const nowMs = Date.now();
+    const now = new Date(nowMs);
+    const tokenHash = this.hashToken(rawToken);
+
+    const storedToken = await this.refreshTokenRepository.findOne({
+      where: { token_hash: tokenHash },
+    });
+
+    if (!storedToken) {
+      throw new InvalidTokenException();
+    }
+
+    if (storedToken.expires_at.getTime() <= nowMs) {
+      throw new TokenExpiredException();
+    }
+
+    this.verifyRefreshJwt(rawToken, storedToken);
+
+    if (storedToken.revoked_at !== null) {
+      return this.handleRevokedRefreshToken(storedToken, rawToken, nowMs);
+    }
+
+    const user = await this.usersService.findById(storedToken.user_id);
+    if (!user) {
+      throw new InvalidTokenException();
+    }
+
+    const rotated = await this.dataSource.transaction(async (manager) => {
+      const updateResult = await manager.update(
+        RefreshToken,
+        { id: storedToken.id, revoked_at: IsNull() },
+        { revoked_at: now },
+      );
+
+      if (updateResult.affected === 0) {
+        return null;
+      }
+
+      const { rawToken: newRefreshToken, entity: newRefreshTokenEntity } =
+        this.buildRefreshToken(user.id, storedToken.family);
+
+      this.cacheRotatedRefreshToken(
+        newRefreshTokenEntity.token_hash,
+        newRefreshToken,
+        nowMs,
+      );
+
+      try {
+        await manager.save(RefreshToken, newRefreshTokenEntity);
+      } catch (error: unknown) {
+        this.rotatedTokenGraceCache.delete(newRefreshTokenEntity.token_hash);
+        throw error;
+      }
+
+      return {
+        access_token: this.signAccessToken(user.id, user.email),
+        refresh_token: newRefreshToken,
+      };
+    });
+
+    if (rotated) {
+      return rotated;
+    }
+
+    const reloadedToken = await this.refreshTokenRepository.findOne({
+      where: { id: storedToken.id },
+    });
+    if (!reloadedToken || reloadedToken.revoked_at === null) {
+      throw new InvalidTokenException();
+    }
+
+    return this.handleRevokedRefreshToken(reloadedToken, rawToken, Date.now());
+  }
+
+  private async handleRevokedRefreshToken(
+    storedToken: RefreshToken,
+    fallbackRawToken: string,
+    nowMs: number,
+  ): Promise<{ access_token: string; refresh_token: string }> {
+    const elapsedMs = nowMs - storedToken.revoked_at!.getTime();
+
+    if (elapsedMs > REFRESH_GRACE_PERIOD_MS) {
+      await this.refreshTokenRepository.update(
+        { family: storedToken.family, revoked_at: IsNull() },
+        { revoked_at: new Date(nowMs) },
+      );
+      throw new TokenReuseDetectedException();
+    }
+
+    const latestActiveToken = await this.refreshTokenRepository.findOne({
+      where: {
+        family: storedToken.family,
+        revoked_at: IsNull(),
+      },
+      order: { created_at: 'DESC' },
+    });
+
+    if (!latestActiveToken) {
+      throw new InvalidTokenException();
+    }
+
+    if (latestActiveToken.expires_at.getTime() <= nowMs) {
+      throw new TokenExpiredException();
+    }
+
+    const user = await this.usersService.findById(storedToken.user_id);
+    if (!user) {
+      throw new InvalidTokenException();
+    }
+
+    const cachedRefreshToken = this.getCachedRefreshToken(
+      latestActiveToken.token_hash,
+      nowMs,
+    );
+
+    return {
+      access_token: this.signAccessToken(user.id, user.email),
+      refresh_token: cachedRefreshToken ?? fallbackRawToken,
+    };
+  }
+
+  private signAccessToken(userId: string, email: string): string {
+    return this.jwtService.sign(
+      { sub: userId, email },
       {
         expiresIn: this.auth.jwtAccessExpiration as JwtSignOptions['expiresIn'],
       },
     );
+  }
 
-    const family = randomUUID();
+  private buildRefreshToken(
+    userId: string,
+    family: string,
+  ): { rawToken: string; entity: RefreshToken } {
     const tokenId = randomUUID();
-    const refreshToken = this.jwtService.sign(
-      { sub: user.id, family, jti: tokenId },
+    const rawToken = this.jwtService.sign(
+      { sub: userId, family, jti: tokenId },
       {
         secret: this.auth.jwtRefreshSecret,
         expiresIn: this.auth
@@ -190,26 +337,78 @@ export class AuthService {
     );
 
     const decodedRefresh = this.jwtService.decode<{ exp?: number } | null>(
-      refreshToken,
+      rawToken,
     );
     if (!decodedRefresh || typeof decodedRefresh.exp !== 'number') {
       throw new Error('Refresh token is missing exp claim');
     }
 
-    const tokenHash = this.hashToken(refreshToken);
-    const refreshTokenEntity = this.refreshTokenRepository.create({
+    const tokenHash = this.hashToken(rawToken);
+    const entity = this.refreshTokenRepository.create({
       token_hash: tokenHash,
       family,
-      user_id: user.id,
+      user_id: userId,
       expires_at: new Date(decodedRefresh.exp * 1000),
       revoked_at: null,
     });
-    await this.refreshTokenRepository.save(refreshTokenEntity);
 
-    return {
-      access_token: accessToken,
-      refresh_token: refreshToken,
-    };
+    return { rawToken, entity };
+  }
+
+  private verifyRefreshJwt(rawToken: string, storedToken: RefreshToken): void {
+    let payload: { sub?: unknown; family?: unknown };
+    try {
+      payload = this.jwtService.verify<{ sub?: unknown; family?: unknown }>(
+        rawToken,
+        {
+          secret: this.auth.jwtRefreshSecret,
+          ignoreExpiration: true,
+        },
+      );
+    } catch {
+      throw new InvalidTokenException();
+    }
+
+    if (
+      payload.sub !== storedToken.user_id ||
+      payload.family !== storedToken.family
+    ) {
+      throw new InvalidTokenException();
+    }
+  }
+
+  private cacheRotatedRefreshToken(
+    tokenHash: string,
+    rawToken: string,
+    nowMs: number,
+  ): void {
+    for (const [key, entry] of this.rotatedTokenGraceCache.entries()) {
+      if (nowMs > entry.expiresAtMs) {
+        this.rotatedTokenGraceCache.delete(key);
+      }
+    }
+
+    this.rotatedTokenGraceCache.set(tokenHash, {
+      rawToken,
+      expiresAtMs: nowMs + REFRESH_GRACE_PERIOD_MS,
+    });
+  }
+
+  private getCachedRefreshToken(
+    tokenHash: string,
+    nowMs: number,
+  ): string | undefined {
+    const entry = this.rotatedTokenGraceCache.get(tokenHash);
+    if (!entry) {
+      return undefined;
+    }
+
+    if (nowMs > entry.expiresAtMs) {
+      this.rotatedTokenGraceCache.delete(tokenHash);
+      return undefined;
+    }
+
+    return entry.rawToken;
   }
 
   private hashToken(raw: string): string {

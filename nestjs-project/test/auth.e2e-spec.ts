@@ -801,4 +801,256 @@ describe('AuthController (e2e)', () => {
         .expect(201);
     });
   });
+
+  describe('POST /auth/refresh', () => {
+    const registerConfirmAndLogin = async (
+      email: string,
+    ): Promise<{
+      userId: string;
+      access_token: string;
+      refresh_token: string;
+    }> => {
+      const { userId, token } = await registerAndGetToken(email);
+      await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({ token })
+        .expect(204);
+
+      const loginResponse = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email,
+          password: 'StrongPassword123',
+        })
+        .expect(200);
+
+      const tokens = loginResponse.body as LoginResponseBody;
+      return {
+        userId,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+      };
+    };
+
+    it('should return 200 with rotated tokens in the same family and revoke old token', async () => {
+      const { userId, refresh_token: initialRefreshToken } =
+        await registerConfirmAndLogin('refresh-e2e@example.com');
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: initialRefreshToken })
+        .expect(200);
+
+      const body = response.body as LoginResponseBody;
+      expect(typeof body.access_token).toBe('string');
+      expect(typeof body.refresh_token).toBe('string');
+      expect(body.refresh_token).not.toBe(initialRefreshToken);
+
+      await request(app.getHttpServer())
+        .get('/test-protected/me')
+        .set('Authorization', `Bearer ${body.access_token}`)
+        .expect(200);
+
+      const initialDecoded = jwtService.decode<{ family: string } | null>(
+        initialRefreshToken,
+      );
+      const rotatedDecoded = jwtService.decode<{ family: string } | null>(
+        body.refresh_token,
+      );
+      expect(rotatedDecoded?.family).toBe(initialDecoded?.family);
+
+      const tokens = await dataSource.getRepository(RefreshToken).find({
+        where: { user_id: userId },
+        order: { created_at: 'ASC' },
+      });
+      expect(tokens).toHaveLength(2);
+      expect(tokens[0].revoked_at).toBeInstanceOf(Date);
+      expect(tokens[1].revoked_at).toBeNull();
+    });
+
+    it('should return 200 with active refresh token within 10s grace period without creating a third token', async () => {
+      const { userId, refresh_token: initialRefreshToken } =
+        await registerConfirmAndLogin('refresh-grace-e2e@example.com');
+
+      const firstRefreshRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: initialRefreshToken })
+        .expect(200);
+      const firstBody = firstRefreshRes.body as LoginResponseBody;
+
+      const graceRefreshRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: initialRefreshToken })
+        .expect(200);
+      const graceBody = graceRefreshRes.body as LoginResponseBody;
+
+      expect(typeof graceBody.access_token).toBe('string');
+      expect(graceBody.refresh_token).toBe(firstBody.refresh_token);
+
+      const tokens = await dataSource.getRepository(RefreshToken).find({
+        where: { user_id: userId },
+      });
+      expect(tokens).toHaveLength(2);
+      expect(tokens.filter((token) => token.revoked_at === null)).toHaveLength(
+        1,
+      );
+
+      await request(app.getHttpServer())
+        .get('/test-protected/me')
+        .set('Authorization', `Bearer ${graceBody.access_token}`)
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: graceBody.refresh_token })
+        .expect(200);
+    });
+
+    it('should return 401 TOKEN_REUSE_DETECTED and revoke entire family when reusing token beyond 10s grace period', async () => {
+      const { userId, refresh_token: initialRefreshToken } =
+        await registerConfirmAndLogin('refresh-reuse-e2e@example.com');
+
+      const firstRefreshRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: initialRefreshToken })
+        .expect(200);
+      const rotatedToken = (firstRefreshRes.body as LoginResponseBody)
+        .refresh_token;
+
+      const staleRevokedAt = new Date(Date.now() - 11_000);
+
+      // Update only the first (already revoked) token's revoked_at to >10s ago
+      const allTokens = await dataSource.getRepository(RefreshToken).find({
+        where: { user_id: userId },
+        order: { created_at: 'ASC' },
+      });
+      await dataSource
+        .getRepository(RefreshToken)
+        .update({ id: allTokens[0].id }, { revoked_at: staleRevokedAt });
+
+      const reuseRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: initialRefreshToken })
+        .expect(401);
+
+      expect(reuseRes.body as ErrorResponseBody).toEqual({
+        statusCode: 401,
+        error: 'TOKEN_REUSE_DETECTED',
+        message: 'Token reuse detected — all sessions revoked',
+      });
+
+      const tokensAfterReuse = await dataSource
+        .getRepository(RefreshToken)
+        .find({
+          where: { user_id: userId },
+        });
+      expect(tokensAfterReuse).toHaveLength(2);
+      expect(
+        tokensAfterReuse.every((token) => token.revoked_at instanceof Date),
+      ).toBe(true);
+
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: rotatedToken })
+        .expect(401);
+    });
+
+    it('should return 401 INVALID_TOKEN when refresh_token is unknown', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: 'unknown.refresh.token' })
+        .expect(401);
+
+      expect(response.body as ErrorResponseBody).toEqual({
+        statusCode: 401,
+        error: 'INVALID_TOKEN',
+        message: 'Invalid or already used token',
+      });
+    });
+
+    it('should return 401 TOKEN_EXPIRED when refresh_token is expired in database', async () => {
+      const { userId, refresh_token } = await registerConfirmAndLogin(
+        'refresh-expired-e2e@example.com',
+      );
+
+      await dataSource
+        .getRepository(RefreshToken)
+        .update(
+          { user_id: userId },
+          { expires_at: new Date(Date.now() - 60_000) },
+        );
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token })
+        .expect(401);
+
+      expect(response.body as ErrorResponseBody).toEqual({
+        statusCode: 401,
+        error: 'TOKEN_EXPIRED',
+        message: 'Token has expired',
+      });
+    });
+
+    it('should return 400 VALIDATION_ERROR when refresh_token is missing, empty, or body has unknown properties', async () => {
+      const emptyRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: '' })
+        .expect(400);
+
+      const emptyBody = emptyRes.body as ErrorResponseBody;
+      expect(emptyBody.statusCode).toBe(400);
+      expect(emptyBody.error).toBe('VALIDATION_ERROR');
+      expect(emptyBody.message).toEqual(
+        expect.arrayContaining(['refresh_token should not be empty']),
+      );
+
+      const missingRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({})
+        .expect(400);
+
+      const missingBody = missingRes.body as ErrorResponseBody;
+      expect(missingBody.statusCode).toBe(400);
+      expect(missingBody.error).toBe('VALIDATION_ERROR');
+      expect(missingBody.message).toEqual(
+        expect.arrayContaining([
+          'refresh_token should not be empty',
+          'refresh_token must be a string',
+        ]),
+      );
+
+      const extraRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: 'some-token', extraField: 'nope' })
+        .expect(400);
+
+      const extraBody = extraRes.body as ErrorResponseBody;
+      expect(extraBody.statusCode).toBe(400);
+      expect(extraBody.error).toBe('VALIDATION_ERROR');
+      expect(extraBody.message).toEqual(
+        expect.arrayContaining(['property extraField should not exist']),
+      );
+    });
+
+    it('should return 200 on POST /auth/refresh even when an expired Authorization Bearer header is attached', async () => {
+      const { userId, refresh_token } = await registerConfirmAndLogin(
+        'refresh-expired-bearer-e2e@example.com',
+      );
+      const expiredAccessToken = jwtService.sign(
+        { sub: userId, email: 'refresh-expired-bearer-e2e@example.com' },
+        { expiresIn: '-1s' },
+      );
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .set('Authorization', `Bearer ${expiredAccessToken}`)
+        .send({ refresh_token })
+        .expect(200);
+
+      const body = response.body as LoginResponseBody;
+      expect(typeof body.access_token).toBe('string');
+      expect(typeof body.refresh_token).toBe('string');
+    });
+  });
 });

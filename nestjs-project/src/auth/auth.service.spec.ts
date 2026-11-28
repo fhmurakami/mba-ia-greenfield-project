@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import * as argon2 from 'argon2';
 import type { ConfigType } from '@nestjs/config';
 import { JwtModule, JwtService, type JwtSignOptions } from '@nestjs/jwt';
@@ -17,12 +17,14 @@ import {
   InvalidCredentialsException,
   InvalidTokenException,
   TokenExpiredException,
+  TokenReuseDetectedException,
 } from '../common/exceptions/domain.exception';
 import authConfig from '../config/auth.config';
 import { MailService } from '../mail/mail.service';
 import { Channel } from '../users/entities/channel.entity';
 import { User } from '../users/entities/user.entity';
 import { UsersService } from '../users/users.service';
+import { REFRESH_GRACE_PERIOD_MS } from './auth.constants';
 import { AuthService } from './auth.service';
 import { RefreshToken } from './entities/refresh-token.entity';
 import {
@@ -50,12 +52,13 @@ describe('AuthService (unit)', () => {
       | 'existsByEmail'
       | 'createUserWithChannel'
       | 'findByEmail'
+      | 'findById'
       | 'markEmailConfirmed'
     >
   >;
   let mailService: jest.Mocked<Pick<MailService, 'sendConfirmationEmail'>>;
   let refreshTokenRepository: jest.Mocked<
-    Pick<Repository<RefreshToken>, 'create' | 'save'>
+    Pick<Repository<RefreshToken>, 'create' | 'save' | 'findOne' | 'update'>
   >;
   let verificationTokenRepository: jest.Mocked<
     Pick<Repository<VerificationToken>, 'create' | 'findOne'>
@@ -69,6 +72,7 @@ describe('AuthService (unit)', () => {
       existsByEmail: jest.fn(),
       createUserWithChannel: jest.fn(),
       findByEmail: jest.fn(),
+      findById: jest.fn(),
       markEmailConfirmed: jest.fn(),
     };
     mailService = {
@@ -77,6 +81,8 @@ describe('AuthService (unit)', () => {
     refreshTokenRepository = {
       create: jest.fn(),
       save: jest.fn(),
+      findOne: jest.fn(),
+      update: jest.fn(),
     };
     verificationTokenRepository = {
       create: jest.fn(),
@@ -141,10 +147,13 @@ describe('AuthService (unit)', () => {
     usersService.existsByEmail.mockReset();
     usersService.createUserWithChannel.mockReset();
     usersService.findByEmail.mockReset();
+    usersService.findById.mockReset();
     usersService.markEmailConfirmed.mockReset();
     mailService.sendConfirmationEmail.mockReset();
     refreshTokenRepository.create.mockReset();
     refreshTokenRepository.save.mockReset();
+    refreshTokenRepository.findOne.mockReset();
+    refreshTokenRepository.update.mockReset();
     verificationTokenRepository.create.mockReset();
     verificationTokenRepository.findOne.mockReset();
     entityManager.save.mockReset();
@@ -159,12 +168,19 @@ describe('AuthService (unit)', () => {
     refreshTokenRepository.save.mockImplementation((entity) =>
       Promise.resolve(Object.assign(new RefreshToken(), entity)),
     );
+    refreshTokenRepository.update.mockResolvedValue({
+      affected: 1,
+      raw: [],
+      generatedMaps: [],
+    } satisfies UpdateResult);
     verificationTokenRepository.create.mockImplementation((entityLike) =>
       Object.assign(new VerificationToken(), entityLike),
     );
     entityManager.save.mockImplementation(
-      (_targetOrEntity: unknown, entity?: unknown) =>
-        Promise.resolve(Object.assign(new VerificationToken(), entity)),
+      (targetOrEntity: unknown, entity?: unknown) =>
+        targetOrEntity === RefreshToken
+          ? Promise.resolve(Object.assign(new RefreshToken(), entity))
+          : Promise.resolve(Object.assign(new VerificationToken(), entity)),
     );
     entityManager.update.mockResolvedValue({
       affected: 1,
@@ -757,6 +773,364 @@ describe('AuthService (unit)', () => {
       ).rejects.toThrow(EmailNotConfirmedException);
 
       expect(refreshTokenRepository.save).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('refresh', () => {
+    const userId = 'user-uuid-1';
+    const userEmail = 'alice@example.com';
+
+    const createUserForRefresh = (): User =>
+      Object.assign(new User(), {
+        id: userId,
+        email: userEmail,
+        is_confirmed: true,
+      });
+
+    const signTestRefreshJwt = (
+      family: string,
+      secret = mockAuthConfig.jwtRefreshSecret,
+      expiresIn = mockAuthConfig.jwtRefreshExpiration,
+    ): string =>
+      jwtService.sign(
+        { sub: userId, family, jti: randomUUID() },
+        {
+          secret,
+          expiresIn: expiresIn as JwtSignOptions['expiresIn'],
+        },
+      );
+
+    const createStoredRefreshToken = (
+      rawToken: string,
+      family: string,
+      overrides: Partial<RefreshToken> = {},
+    ): RefreshToken =>
+      Object.assign(new RefreshToken(), {
+        id: 'refresh-uuid-1',
+        token_hash: createHash('sha256').update(rawToken).digest('hex'),
+        family,
+        user_id: userId,
+        expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        revoked_at: null,
+        ...overrides,
+      });
+
+    it('should rotate valid refresh token inside transaction and issue new tokens in the same family', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const family = randomUUID();
+      const rawToken = signTestRefreshJwt(family);
+      const storedToken = createStoredRefreshToken(rawToken, family, {
+        expires_at: new Date(fixedNow + 60_000),
+      });
+
+      refreshTokenRepository.findOne.mockResolvedValueOnce(storedToken);
+      usersService.findById.mockResolvedValueOnce(createUserForRefresh());
+
+      const result = await authService.refresh(rawToken);
+
+      expect(dataSource.transaction).toHaveBeenCalledTimes(1);
+      expect(entityManager.update).toHaveBeenCalledWith(
+        RefreshToken,
+        { id: storedToken.id, revoked_at: IsNull() },
+        { revoked_at: new Date(fixedNow) },
+      );
+      expect(entityManager.save).toHaveBeenCalledTimes(1);
+      expect(result.refresh_token).not.toBe(rawToken);
+
+      const accessPayload = jwtService.verify<{
+        sub: string;
+        email: string;
+      }>(result.access_token);
+      expect(accessPayload.sub).toBe(userId);
+      expect(accessPayload.email).toBe(userEmail);
+
+      const rotatedPayload = jwtService.verify<{
+        sub: string;
+        family: string;
+        jti: string;
+        exp: number;
+      }>(result.refresh_token, { secret: mockAuthConfig.jwtRefreshSecret });
+      expect(rotatedPayload.sub).toBe(userId);
+      expect(rotatedPayload.family).toBe(family);
+
+      const expectedNewHash = createHash('sha256')
+        .update(result.refresh_token)
+        .digest('hex');
+      expect(refreshTokenRepository.create).toHaveBeenCalledWith({
+        token_hash: expectedNewHash,
+        family,
+        user_id: userId,
+        expires_at: new Date(rotatedPayload.exp * 1000),
+        revoked_at: null,
+      });
+    });
+
+    it('should throw InvalidTokenException when token_hash is not found', async () => {
+      refreshTokenRepository.findOne.mockResolvedValueOnce(null);
+
+      await expect(authService.refresh('missing-token')).rejects.toThrow(
+        InvalidTokenException,
+      );
+
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+    });
+
+    it('should throw TokenExpiredException when expires_at is at or before now', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const family = randomUUID();
+      const rawToken = signTestRefreshJwt(family);
+      const expiredToken = createStoredRefreshToken(rawToken, family, {
+        expires_at: new Date(fixedNow),
+      });
+
+      refreshTokenRepository.findOne.mockResolvedValueOnce(expiredToken);
+
+      await expect(authService.refresh(rawToken)).rejects.toThrow(
+        TokenExpiredException,
+      );
+
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+    });
+
+    it('should throw InvalidTokenException when JWT signature is invalid', async () => {
+      const family = randomUUID();
+      const wrongSecretToken = signTestRefreshJwt(
+        family,
+        mockAuthConfig.jwtSecret,
+      );
+      const storedToken = createStoredRefreshToken(wrongSecretToken, family);
+
+      refreshTokenRepository.findOne.mockResolvedValueOnce(storedToken);
+
+      await expect(authService.refresh(wrongSecretToken)).rejects.toThrow(
+        InvalidTokenException,
+      );
+
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+    });
+
+    it('should throw InvalidTokenException when user is not found', async () => {
+      const family = randomUUID();
+      const rawToken = signTestRefreshJwt(family);
+      const storedToken = createStoredRefreshToken(rawToken, family);
+
+      refreshTokenRepository.findOne.mockResolvedValueOnce(storedToken);
+      usersService.findById.mockResolvedValueOnce(null);
+
+      await expect(authService.refresh(rawToken)).rejects.toThrow(
+        InvalidTokenException,
+      );
+
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+    });
+
+    it('should return valid access_token and active refresh_token within 10s grace period without creating another token or revoking family', async () => {
+      const t0 = new Date('2026-11-27T12:00:00.000Z').getTime();
+      const dateNowSpy = jest.spyOn(Date, 'now').mockReturnValue(t0);
+
+      const family = randomUUID();
+      const token1 = signTestRefreshJwt(family);
+      const storedToken1 = createStoredRefreshToken(token1, family, {
+        expires_at: new Date(t0 + 7 * 24 * 60 * 60 * 1000),
+      });
+
+      refreshTokenRepository.findOne.mockResolvedValueOnce(storedToken1);
+      usersService.findById.mockResolvedValueOnce(createUserForRefresh());
+
+      const firstRotation = await authService.refresh(token1);
+      const token2 = firstRotation.refresh_token;
+      const token2Hash = createHash('sha256').update(token2).digest('hex');
+
+      dateNowSpy.mockReturnValue(t0 + REFRESH_GRACE_PERIOD_MS);
+      const revokedToken1 = createStoredRefreshToken(token1, family, {
+        revoked_at: new Date(t0),
+        expires_at: new Date(t0 + 7 * 24 * 60 * 60 * 1000),
+      });
+      const activeToken2 = Object.assign(new RefreshToken(), {
+        id: 'refresh-uuid-2',
+        token_hash: token2Hash,
+        family,
+        user_id: userId,
+        expires_at: new Date(t0 + 7 * 24 * 60 * 60 * 1000),
+        revoked_at: null,
+      });
+
+      refreshTokenRepository.findOne
+        .mockResolvedValueOnce(revokedToken1)
+        .mockResolvedValueOnce(activeToken2);
+      usersService.findById.mockResolvedValueOnce(createUserForRefresh());
+
+      const graceResult = await authService.refresh(token1);
+
+      expect(graceResult.refresh_token).toBe(token2);
+      expect(
+        jwtService.verify<{ sub: string; email: string }>(
+          graceResult.access_token,
+        ).sub,
+      ).toBe(userId);
+      expect(refreshTokenRepository.findOne).toHaveBeenLastCalledWith({
+        where: { family, revoked_at: IsNull() },
+        order: { created_at: 'DESC' },
+      });
+      expect(entityManager.save).toHaveBeenCalledTimes(1);
+      expect(refreshTokenRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('should throw InvalidTokenException within grace period when no active token remains in family', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const family = randomUUID();
+      const rawToken = signTestRefreshJwt(family);
+      const revokedToken = createStoredRefreshToken(rawToken, family, {
+        revoked_at: new Date(fixedNow - 1_000),
+        expires_at: new Date(fixedNow + 60_000),
+      });
+
+      refreshTokenRepository.findOne
+        .mockResolvedValueOnce(revokedToken)
+        .mockResolvedValueOnce(null);
+
+      await expect(authService.refresh(rawToken)).rejects.toThrow(
+        InvalidTokenException,
+      );
+
+      expect(refreshTokenRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('should revoke entire family and throw TokenReuseDetectedException when reused beyond 10s grace period', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const family = randomUUID();
+      const rawToken = signTestRefreshJwt(family);
+      const staleRevokedToken = createStoredRefreshToken(rawToken, family, {
+        revoked_at: new Date(fixedNow - (REFRESH_GRACE_PERIOD_MS + 1)),
+        expires_at: new Date(fixedNow + 60_000),
+      });
+
+      refreshTokenRepository.findOne.mockResolvedValueOnce(staleRevokedToken);
+
+      await expect(authService.refresh(rawToken)).rejects.toThrow(
+        TokenReuseDetectedException,
+      );
+
+      expect(refreshTokenRepository.update).toHaveBeenCalledWith(
+        { family, revoked_at: IsNull() },
+        { revoked_at: new Date(fixedNow) },
+      );
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+    });
+
+    it('should handle concurrent rotation race when conditional update affects 0 rows', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const family = randomUUID();
+      const token1 = signTestRefreshJwt(family);
+      const token2 = signTestRefreshJwt(family);
+
+      const initialToken = createStoredRefreshToken(token1, family, {
+        revoked_at: null,
+        expires_at: new Date(fixedNow + 60_000),
+      });
+      const reloadedRevokedToken = createStoredRefreshToken(token1, family, {
+        revoked_at: new Date(fixedNow - 50),
+        expires_at: new Date(fixedNow + 60_000),
+      });
+      const activeToken2 = createStoredRefreshToken(token2, family, {
+        id: 'refresh-uuid-2',
+        revoked_at: null,
+        expires_at: new Date(fixedNow + 60_000),
+      });
+
+      refreshTokenRepository.findOne
+        .mockResolvedValueOnce(initialToken)
+        .mockResolvedValueOnce(reloadedRevokedToken)
+        .mockResolvedValueOnce(activeToken2);
+      usersService.findById
+        .mockResolvedValueOnce(createUserForRefresh())
+        .mockResolvedValueOnce(createUserForRefresh());
+      entityManager.update.mockResolvedValueOnce({
+        affected: 0,
+        raw: [],
+        generatedMaps: [],
+      } satisfies UpdateResult);
+
+      const result = await authService.refresh(token1);
+
+      expect(jwtService.verify<{ sub: string }>(result.access_token).sub).toBe(
+        userId,
+      );
+      expect(entityManager.save).not.toHaveBeenCalled();
+    });
+
+    it('should throw TokenExpiredException within grace period when latest active token in family is expired', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const family = randomUUID();
+      const token1 = signTestRefreshJwt(family);
+      const token2 = signTestRefreshJwt(family);
+
+      const revokedToken1 = createStoredRefreshToken(token1, family, {
+        revoked_at: new Date(fixedNow - 1_000),
+        expires_at: new Date(fixedNow + 60_000),
+      });
+      const expiredActiveToken2 = createStoredRefreshToken(token2, family, {
+        id: 'refresh-uuid-2',
+        revoked_at: null,
+        expires_at: new Date(fixedNow),
+      });
+
+      refreshTokenRepository.findOne
+        .mockResolvedValueOnce(revokedToken1)
+        .mockResolvedValueOnce(expiredActiveToken2);
+
+      await expect(authService.refresh(token1)).rejects.toThrow(
+        TokenExpiredException,
+      );
+
+      expect(refreshTokenRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('should propagate error and evict tentative grace-cache entry when saving rotated token fails inside transaction', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      const family = randomUUID();
+      const token1 = signTestRefreshJwt(family);
+      const storedToken1 = createStoredRefreshToken(token1, family, {
+        expires_at: new Date(fixedNow + 60_000),
+      });
+
+      refreshTokenRepository.findOne.mockResolvedValueOnce(storedToken1);
+      usersService.findById.mockResolvedValueOnce(createUserForRefresh());
+      const saveError = new Error('Refresh token save failed');
+      entityManager.save.mockRejectedValueOnce(saveError);
+
+      await expect(authService.refresh(token1)).rejects.toBe(saveError);
+
+      // Subsequent grace-period fallback should not receive a deleted tentative cache entry
+      const createdEntity = refreshTokenRepository.create.mock.results[0];
+      if (createdEntity.type !== 'return') {
+        throw new Error('Expected refreshTokenRepository.create to return');
+      }
+      const revokedToken1 = createStoredRefreshToken(token1, family, {
+        revoked_at: new Date(fixedNow),
+        expires_at: new Date(fixedNow + 60_000),
+      });
+      refreshTokenRepository.findOne
+        .mockResolvedValueOnce(revokedToken1)
+        .mockResolvedValueOnce(createdEntity.value);
+      usersService.findById.mockResolvedValueOnce(createUserForRefresh());
+
+      const fallbackResult = await authService.refresh(token1);
+      expect(fallbackResult.refresh_token).toBe(token1);
     });
   });
 });
