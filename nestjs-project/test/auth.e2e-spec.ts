@@ -26,8 +26,12 @@ import { User } from '../src/users/entities/user.entity';
 import { clearTestTables } from './create-test-data-source';
 import {
   clearMailpitMessages,
+  extractConfirmationTokenFromMailpit,
+  extractPasswordResetTokenFromMailpit,
   getMailpitMessage,
   getMailpitMessages,
+  type MailpitMessageDetail,
+  type MailpitMessageSummary,
 } from './mailpit';
 
 interface RegisterResponseBody {
@@ -44,17 +48,6 @@ interface ErrorResponseBody {
   statusCode: number;
   error: string;
   message: string | string[];
-}
-
-interface MailpitMessageSummary {
-  ID: string;
-  Subject: string;
-  To: { Address: string }[];
-}
-
-interface MailpitMessageDetail {
-  ID: string;
-  HTML: string;
 }
 
 @SkipThrottle()
@@ -102,33 +95,9 @@ describe('AuthController (e2e)', () => {
     await clearMailpitMessages();
   });
 
-  const extractConfirmationToken = async (): Promise<string> => {
-    const messages = (await getMailpitMessages()) as MailpitMessageSummary[];
-    expect(messages.length).toBeGreaterThan(0);
+  const extractConfirmationToken = extractConfirmationTokenFromMailpit;
 
-    const detail = (await getMailpitMessage(
-      messages[0].ID,
-    )) as MailpitMessageDetail;
-    const match = /\/auth\/confirm-email\?token=([a-f0-9]{64})/.exec(
-      detail.HTML,
-    );
-    expect(match).not.toBeNull();
-    return match![1];
-  };
-
-  const extractPasswordResetToken = async (): Promise<string> => {
-    const messages = (await getMailpitMessages()) as MailpitMessageSummary[];
-    expect(messages.length).toBeGreaterThan(0);
-
-    const detail = (await getMailpitMessage(
-      messages[0].ID,
-    )) as MailpitMessageDetail;
-    const match = /\/auth\/reset-password\?token=([a-f0-9]{64})/.exec(
-      detail.HTML,
-    );
-    expect(match).not.toBeNull();
-    return match![1];
-  };
+  const extractPasswordResetToken = extractPasswordResetTokenFromMailpit;
 
   const registerAndGetToken = async (
     email: string,
@@ -144,6 +113,42 @@ describe('AuthController (e2e)', () => {
     const body = response.body as RegisterResponseBody;
     const token = await extractConfirmationToken();
     return { userId: body.id, token };
+  };
+
+  const registerAndConfirmUser = async (
+    email: string,
+  ): Promise<{ userId: string }> => {
+    const { userId, token } = await registerAndGetToken(email);
+    await request(app.getHttpServer())
+      .post('/auth/confirm-email')
+      .send({ token })
+      .expect(204);
+    await clearMailpitMessages();
+    return { userId };
+  };
+
+  const registerConfirmAndLogin = async (
+    email: string,
+  ): Promise<{
+    userId: string;
+    access_token: string;
+    refresh_token: string;
+  }> => {
+    const { userId } = await registerAndConfirmUser(email);
+    const loginResponse = await request(app.getHttpServer())
+      .post('/auth/login')
+      .send({
+        email,
+        password: 'StrongPassword123',
+      })
+      .expect(200);
+
+    const tokens = loginResponse.body as LoginResponseBody;
+    return {
+      userId,
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
+    };
   };
 
   describe('POST /auth/register', () => {
@@ -547,17 +552,6 @@ describe('AuthController (e2e)', () => {
   });
 
   describe('POST /auth/login', () => {
-    const registerAndConfirmUser = async (
-      email: string,
-    ): Promise<{ userId: string }> => {
-      const { userId, token } = await registerAndGetToken(email);
-      await request(app.getHttpServer())
-        .post('/auth/confirm-email')
-        .send({ token })
-        .expect(204);
-      return { userId };
-    };
-
     it('should return 200 with access_token and refresh_token for confirmed user and persist refresh token', async () => {
       const { userId } = await registerAndConfirmUser('login-e2e@example.com');
 
@@ -682,35 +676,6 @@ describe('AuthController (e2e)', () => {
   });
 
   describe('JWT Access Token Guard & @Public()', () => {
-    const registerConfirmAndLogin = async (
-      email: string,
-    ): Promise<{
-      userId: string;
-      access_token: string;
-      refresh_token: string;
-    }> => {
-      const { userId, token } = await registerAndGetToken(email);
-      await request(app.getHttpServer())
-        .post('/auth/confirm-email')
-        .send({ token })
-        .expect(204);
-
-      const loginResponse = await request(app.getHttpServer())
-        .post('/auth/login')
-        .send({
-          email,
-          password: 'StrongPassword123',
-        })
-        .expect(200);
-
-      const tokens = loginResponse.body as LoginResponseBody;
-      return {
-        userId,
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-      };
-    };
-
     it('should return 401 on protected endpoint when Authorization header is missing', async () => {
       const response = await request(app.getHttpServer())
         .get('/test-protected/me')
@@ -812,35 +777,6 @@ describe('AuthController (e2e)', () => {
   });
 
   describe('POST /auth/refresh', () => {
-    const registerConfirmAndLogin = async (
-      email: string,
-    ): Promise<{
-      userId: string;
-      access_token: string;
-      refresh_token: string;
-    }> => {
-      const { userId, token } = await registerAndGetToken(email);
-      await request(app.getHttpServer())
-        .post('/auth/confirm-email')
-        .send({ token })
-        .expect(204);
-
-      const loginResponse = await request(app.getHttpServer())
-        .post('/auth/login')
-        .send({
-          email,
-          password: 'StrongPassword123',
-        })
-        .expect(200);
-
-      const tokens = loginResponse.body as LoginResponseBody;
-      return {
-        userId,
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-      };
-    };
-
     it('should return 200 with rotated tokens in the same family and revoke old token', async () => {
       const { userId, refresh_token: initialRefreshToken } =
         await registerConfirmAndLogin('refresh-e2e@example.com');
@@ -1064,35 +1000,6 @@ describe('AuthController (e2e)', () => {
   });
 
   describe('POST /auth/logout', () => {
-    const registerConfirmAndLogin = async (
-      email: string,
-    ): Promise<{
-      userId: string;
-      access_token: string;
-      refresh_token: string;
-    }> => {
-      const { userId, token } = await registerAndGetToken(email);
-      await request(app.getHttpServer())
-        .post('/auth/confirm-email')
-        .send({ token })
-        .expect(204);
-
-      const loginResponse = await request(app.getHttpServer())
-        .post('/auth/login')
-        .send({
-          email,
-          password: 'StrongPassword123',
-        })
-        .expect(200);
-
-      const tokens = loginResponse.body as LoginResponseBody;
-      return {
-        userId,
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-      };
-    };
-
     it('should return 204 with empty body and revoke all refresh tokens for the authenticated user', async () => {
       const { userId, access_token } = await registerConfirmAndLogin(
         'logout-e2e@example.com',
@@ -1338,36 +1245,6 @@ describe('AuthController (e2e)', () => {
   });
 
   describe('POST /auth/reset-password', () => {
-    const registerConfirmAndLogin = async (
-      email: string,
-    ): Promise<{
-      userId: string;
-      access_token: string;
-      refresh_token: string;
-    }> => {
-      const { userId, token } = await registerAndGetToken(email);
-      await request(app.getHttpServer())
-        .post('/auth/confirm-email')
-        .send({ token })
-        .expect(204);
-
-      const loginResponse = await request(app.getHttpServer())
-        .post('/auth/login')
-        .send({
-          email,
-          password: 'StrongPassword123',
-        })
-        .expect(200);
-      await clearMailpitMessages();
-
-      const tokens = loginResponse.body as LoginResponseBody;
-      return {
-        userId,
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-      };
-    };
-
     it('should return 204 with empty body, allow login with new password, and reject old password with 401 INVALID_CREDENTIALS', async () => {
       await registerConfirmAndLogin('reset-e2e@example.com');
 

@@ -11,8 +11,12 @@ import {
 } from '../../test/create-test-data-source';
 import {
   clearMailpitMessages,
+  extractConfirmationTokenFromMailpit,
+  extractPasswordResetTokenFromMailpit,
   getMailpitMessage,
   getMailpitMessages,
+  type MailpitMessageDetail,
+  type MailpitMessageSummary,
 } from '../../test/mailpit';
 import {
   EmailAlreadyExistsException,
@@ -38,17 +42,6 @@ import {
   VerificationToken,
   VerificationTokenType,
 } from './entities/verification-token.entity';
-
-interface MailpitMessageSummary {
-  ID: string;
-  Subject: string;
-  To: { Address: string }[];
-}
-
-interface MailpitMessageDetail {
-  ID: string;
-  HTML: string;
-}
 
 describe('AuthService (integration)', () => {
   jest.setTimeout(15000);
@@ -107,34 +100,39 @@ describe('AuthService (integration)', () => {
     jest.restoreAllMocks();
   });
 
-  const extractConfirmationTokenFromLatestEmail = async (): Promise<string> => {
-    const messages = (await getMailpitMessages()) as MailpitMessageSummary[];
-    expect(messages.length).toBeGreaterThan(0);
-
-    const detail = (await getMailpitMessage(
-      messages[0].ID,
-    )) as MailpitMessageDetail;
-    const match = /\/auth\/confirm-email\?token=([a-f0-9]{64})/.exec(
-      detail.HTML,
-    );
-    expect(match).not.toBeNull();
-    return match![1];
-  };
+  const extractConfirmationTokenFromLatestEmail =
+    extractConfirmationTokenFromMailpit;
 
   const extractPasswordResetTokenFromLatestEmail =
-    async (): Promise<string> => {
-      const messages = (await getMailpitMessages()) as MailpitMessageSummary[];
-      expect(messages.length).toBeGreaterThan(0);
+    extractPasswordResetTokenFromMailpit;
 
-      const detail = (await getMailpitMessage(
-        messages[0].ID,
-      )) as MailpitMessageDetail;
-      const match = /\/auth\/reset-password\?token=([a-f0-9]{64})/.exec(
-        detail.HTML,
-      );
-      expect(match).not.toBeNull();
-      return match![1];
+  const registerConfirmedUser = async (
+    email: string,
+    password = 'MySecretPassword123',
+  ): Promise<{ id: string; email: string }> => {
+    const registered = await authService.register({ email, password });
+    const rawToken = await extractConfirmationTokenFromLatestEmail();
+    await authService.confirm(rawToken);
+    return registered;
+  };
+
+  const registerConfirmAndLogin = async (
+    email: string,
+    password = 'MySecretPassword123',
+  ): Promise<{
+    userId: string;
+    access_token: string;
+    refresh_token: string;
+  }> => {
+    const registered = await registerConfirmedUser(email, password);
+    const tokens = await authService.login({ email, password });
+    await clearMailpitMessages();
+    return {
+      userId: registered.id,
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
     };
+  };
 
   describe('register', () => {
     it('should persist unconfirmed user with Argon2 password hash and sanitized channel', async () => {
@@ -485,16 +483,6 @@ describe('AuthService (integration)', () => {
   });
 
   describe('login', () => {
-    const registerConfirmedUser = async (
-      email: string,
-      password = 'MySecretPassword123',
-    ): Promise<{ id: string; email: string }> => {
-      const registered = await authService.register({ email, password });
-      const rawToken = await extractConfirmationTokenFromLatestEmail();
-      await authService.confirm(rawToken);
-      return registered;
-    };
-
     it('should return verifiable access and refresh tokens and persist refresh token in database', async () => {
       const registered = await registerConfirmedUser('login-int@example.com');
 
@@ -590,30 +578,6 @@ describe('AuthService (integration)', () => {
   });
 
   describe('refresh', () => {
-    const registerConfirmAndLogin = async (
-      email: string,
-    ): Promise<{
-      userId: string;
-      access_token: string;
-      refresh_token: string;
-    }> => {
-      const registered = await authService.register({
-        email,
-        password: 'MySecretPassword123',
-      });
-      const rawToken = await extractConfirmationTokenFromLatestEmail();
-      await authService.confirm(rawToken);
-      const tokens = await authService.login({
-        email,
-        password: 'MySecretPassword123',
-      });
-      return {
-        userId: registered.id,
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-      };
-    };
-
     it('should rotate refresh token in database, preserve family, and allow chaining next refresh', async () => {
       const { userId, refresh_token: token1 } = await registerConfirmAndLogin(
         'refresh-int@example.com',
@@ -799,30 +763,6 @@ describe('AuthService (integration)', () => {
   });
 
   describe('logout', () => {
-    const registerConfirmAndLogin = async (
-      email: string,
-    ): Promise<{
-      userId: string;
-      access_token: string;
-      refresh_token: string;
-    }> => {
-      const registered = await authService.register({
-        email,
-        password: 'MySecretPassword123',
-      });
-      const rawToken = await extractConfirmationTokenFromLatestEmail();
-      await authService.confirm(rawToken);
-      const tokens = await authService.login({
-        email,
-        password: 'MySecretPassword123',
-      });
-      return {
-        userId: registered.id,
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-      };
-    };
-
     it('should set revoked_at on all active refresh tokens across multiple families while preserving prior revoked_at timestamps', async () => {
       const { userId, refresh_token: session1Token1 } =
         await registerConfirmAndLogin('logout-multi-int@example.com');
@@ -1012,31 +952,6 @@ describe('AuthService (integration)', () => {
   });
 
   describe('resetPassword', () => {
-    const registerConfirmAndLogin = async (
-      email: string,
-    ): Promise<{
-      userId: string;
-      access_token: string;
-      refresh_token: string;
-    }> => {
-      const registered = await authService.register({
-        email,
-        password: 'MySecretPassword123',
-      });
-      const rawToken = await extractConfirmationTokenFromLatestEmail();
-      await authService.confirm(rawToken);
-      const tokens = await authService.login({
-        email,
-        password: 'MySecretPassword123',
-      });
-      await clearMailpitMessages();
-      return {
-        userId: registered.id,
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-      };
-    };
-
     it('should update password hash, mark token used, and revoke all user refresh tokens without affecting other users', async () => {
       const userA = await registerConfirmAndLogin('reset-user-a@example.com');
       const userB = await registerConfirmAndLogin('reset-user-b@example.com');
