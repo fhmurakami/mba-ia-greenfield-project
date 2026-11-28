@@ -1,7 +1,7 @@
 # Phase 02 — Cadastro, Login e Gerenciamento de Conta — Progress
 
 **Status:** in_progress
-**SIs:** 10/13 completed
+**SIs:** 11/13 completed
 
 ### SI-02.1 — Dependencies, Configuration Namespaces, and Docker Compose
 
@@ -65,9 +65,9 @@
 
 ### SI-02.11 — Logout and Session Revocation
 
-- **Status:** pending
-- **Tests:** pending
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 3 suites passed (108 tests)
+- **Observations:** Implemented `AuthService.logout(userId)` revoking all non-revoked refresh tokens for the user (`{ user_id: userId, revoked_at: IsNull() }` → `{ revoked_at: new Date(Date.now()) }`) and added authenticated `@Post('logout') @HttpCode(HttpStatus.NO_CONTENT)` in `AuthController` (protected by global `JwtAuthGuard`, extracting `@CurrentUser('sub') userId`). Verified that post-logout refresh attempts fail with `INVALID_TOKEN` within the 10s grace window (no active token in family) and `TOKEN_REUSE_DETECTED` beyond 10s, without affecting other users' tokens or prior `revoked_at` timestamps. Compared against commit `9e1a38f9`: kept `Repository.update` with `IsNull()` over `QueryBuilder`, `@CurrentUser('sub')`, and `SI-02.10` active-family grace validation; split logout integration/E2E tests into focused scenarios and added coverage for rotated-family grace-cache non-leakage and idempotent repeat logout. Context7 verification: `typeorm@0.3.31` exact docs (`Repository.update` with `IsNull()`), `@nestjs/common@^11.0.1` served current NestJS 11 docs (`@HttpCode(HttpStatus.NO_CONTENT)`, `createParamDecorator`).
 
 ### SI-02.12 — Password Reset (Request and Execute)
 
@@ -92,3 +92,4 @@
 - [ ] Evaluate a global `HttpException` filter to normalize framework error codes (e.g., `UnauthorizedException` -> `UNAUTHORIZED`, `ThrottlerException` -> `TOO_MANY_REQUESTS`) to `UPPER_SNAKE_CASE` alongside `DomainExceptionFilter` and `ValidationExceptionFilter`.
 - [ ] Move AuthService's 10-second refresh-token grace-period cache (`rotatedTokenGraceCache`) from an in-memory `Map` to a shared distributed cache (e.g., Redis) if `nestjs-api` is scaled horizontally across multiple replicas.
 - [ ] Add a scheduled maintenance job to prune expired `refresh_tokens` and `verification_tokens` rows past their audit/reuse-detection retention window so token tables do not grow unbounded.
+- [ ] Evaluate immediate access-token invalidation on logout and password reset (e.g., short-TTL Redis jti denylist or per-user tokens_valid_after timestamp checked in JwtAuthGuard) if stateless JWT access-token validity up to JWT_ACCESS_EXPIRATION is unacceptable for sensitive operations.

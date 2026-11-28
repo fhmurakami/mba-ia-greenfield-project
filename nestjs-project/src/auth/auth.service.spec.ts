@@ -1133,4 +1133,38 @@ describe('AuthService (unit)', () => {
       expect(fallbackResult.refresh_token).toBe(token1);
     });
   });
+
+  describe('logout', () => {
+    it('should revoke all non-revoked refresh tokens for the user', async () => {
+      const fixedNow = new Date('2026-11-27T12:00:00.000Z').getTime();
+      jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+      await authService.logout('user-uuid-1');
+
+      expect(refreshTokenRepository.update).toHaveBeenCalledTimes(1);
+      expect(refreshTokenRepository.update).toHaveBeenCalledWith(
+        { user_id: 'user-uuid-1', revoked_at: IsNull() },
+        { revoked_at: new Date(fixedNow) },
+      );
+    });
+
+    it('should resolve when user has no active refresh tokens', async () => {
+      refreshTokenRepository.update.mockResolvedValueOnce({
+        affected: 0,
+        raw: [],
+        generatedMaps: [],
+      } satisfies UpdateResult);
+
+      await expect(
+        authService.logout('user-uuid-empty'),
+      ).resolves.toBeUndefined();
+    });
+
+    it('should propagate repository update errors', async () => {
+      const dbError = new Error('Database update failed');
+      refreshTokenRepository.update.mockRejectedValueOnce(dbError);
+
+      await expect(authService.logout('user-uuid-1')).rejects.toBe(dbError);
+    });
+  });
 });

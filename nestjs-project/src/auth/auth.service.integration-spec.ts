@@ -786,4 +786,130 @@ describe('AuthService (integration)', () => {
       expect(storedTokens[0].revoked_at).toBeNull();
     });
   });
+
+  describe('logout', () => {
+    const registerConfirmAndLogin = async (
+      email: string,
+    ): Promise<{
+      userId: string;
+      access_token: string;
+      refresh_token: string;
+    }> => {
+      const registered = await authService.register({
+        email,
+        password: 'MySecretPassword123',
+      });
+      const rawToken = await extractConfirmationTokenFromLatestEmail();
+      await authService.confirm(rawToken);
+      const tokens = await authService.login({
+        email,
+        password: 'MySecretPassword123',
+      });
+      return {
+        userId: registered.id,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+      };
+    };
+
+    it('should set revoked_at on all active refresh tokens across multiple families while preserving prior revoked_at timestamps', async () => {
+      const { userId, refresh_token: session1Token1 } =
+        await registerConfirmAndLogin('logout-multi-int@example.com');
+      await authService.login({
+        email: 'logout-multi-int@example.com',
+        password: 'MySecretPassword123',
+      });
+
+      await authService.refresh(session1Token1);
+
+      const priorRevokedAt = new Date(Date.now() - 5_000);
+      const session1Token1Hash = createHash('sha256')
+        .update(session1Token1)
+        .digest('hex');
+      await refreshTokenRepository.update(
+        { token_hash: session1Token1Hash },
+        { revoked_at: priorRevokedAt },
+      );
+
+      await authService.logout(userId);
+
+      const allTokens = await refreshTokenRepository.find({
+        where: { user_id: userId },
+      });
+      expect(allTokens).toHaveLength(3);
+      expect(allTokens.every((token) => token.revoked_at instanceof Date)).toBe(
+        true,
+      );
+
+      const previouslyRevoked = allTokens.find(
+        (token) => token.token_hash === session1Token1Hash,
+      );
+      expect(previouslyRevoked?.revoked_at?.getTime()).toBe(
+        priorRevokedAt.getTime(),
+      );
+    });
+
+    it('should reject post-logout refresh within 10s grace period with InvalidTokenException for both rotated and latest tokens', async () => {
+      const { userId, refresh_token: token1 } = await registerConfirmAndLogin(
+        'logout-grace-int@example.com',
+      );
+      const { refresh_token: token2 } = await authService.refresh(token1);
+
+      await authService.logout(userId);
+
+      await expect(authService.refresh(token1)).rejects.toThrow(
+        InvalidTokenException,
+      );
+      await expect(authService.refresh(token2)).rejects.toThrow(
+        InvalidTokenException,
+      );
+    });
+
+    it('should reject post-logout refresh beyond 10s grace period with TokenReuseDetectedException', async () => {
+      const { userId, refresh_token } = await registerConfirmAndLogin(
+        'logout-reuse-int@example.com',
+      );
+
+      await authService.logout(userId);
+
+      const tokenHash = createHash('sha256')
+        .update(refresh_token)
+        .digest('hex');
+      await refreshTokenRepository.update(
+        { token_hash: tokenHash },
+        { revoked_at: new Date(Date.now() - 11_000) },
+      );
+
+      await expect(authService.refresh(refresh_token)).rejects.toThrow(
+        TokenReuseDetectedException,
+      );
+    });
+
+    it('should not revoke refresh tokens belonging to other users', async () => {
+      const userA = await registerConfirmAndLogin(
+        'logout-user-a-int@example.com',
+      );
+      const userB = await registerConfirmAndLogin(
+        'logout-user-b-int@example.com',
+      );
+
+      await authService.logout(userA.userId);
+
+      const userATokens = await refreshTokenRepository.find({
+        where: { user_id: userA.userId },
+      });
+      expect(userATokens).toHaveLength(1);
+      expect(userATokens[0].revoked_at).toBeInstanceOf(Date);
+
+      const userBTokens = await refreshTokenRepository.find({
+        where: { user_id: userB.userId },
+      });
+      expect(userBTokens).toHaveLength(1);
+      expect(userBTokens[0].revoked_at).toBeNull();
+
+      await expect(
+        authService.refresh(userB.refresh_token),
+      ).resolves.toBeDefined();
+    });
+  });
 });

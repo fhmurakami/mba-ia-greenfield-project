@@ -1053,4 +1053,195 @@ describe('AuthController (e2e)', () => {
       expect(typeof body.refresh_token).toBe('string');
     });
   });
+
+  describe('POST /auth/logout', () => {
+    const registerConfirmAndLogin = async (
+      email: string,
+    ): Promise<{
+      userId: string;
+      access_token: string;
+      refresh_token: string;
+    }> => {
+      const { userId, token } = await registerAndGetToken(email);
+      await request(app.getHttpServer())
+        .post('/auth/confirm-email')
+        .send({ token })
+        .expect(204);
+
+      const loginResponse = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email,
+          password: 'StrongPassword123',
+        })
+        .expect(200);
+
+      const tokens = loginResponse.body as LoginResponseBody;
+      return {
+        userId,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+      };
+    };
+
+    it('should return 204 with empty body and revoke all refresh tokens for the authenticated user', async () => {
+      const { userId, access_token } = await registerConfirmAndLogin(
+        'logout-e2e@example.com',
+      );
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'logout-e2e@example.com',
+          password: 'StrongPassword123',
+        })
+        .expect(200);
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Authorization', `Bearer ${access_token}`)
+        .expect(204);
+
+      expect(response.text).toBe('');
+
+      const repeatResponse = await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Authorization', `Bearer ${access_token}`)
+        .expect(204);
+
+      expect(repeatResponse.text).toBe('');
+
+      const storedTokens = await dataSource.getRepository(RefreshToken).find({
+        where: { user_id: userId },
+      });
+      expect(storedTokens).toHaveLength(2);
+      expect(
+        storedTokens.every((token) => token.revoked_at instanceof Date),
+      ).toBe(true);
+    });
+
+    it('should return 401 when Authorization header is missing', async () => {
+      const missingRes = await request(app.getHttpServer())
+        .post('/auth/logout')
+        .expect(401);
+
+      expect((missingRes.body as ErrorResponseBody).statusCode).toBe(401);
+      expect((missingRes.body as ErrorResponseBody).error).toBe('Unauthorized');
+    });
+
+    it('should return 401 when Bearer token is malformed, expired, or signed with refresh secret without revoking stored tokens', async () => {
+      const { userId, refresh_token } = await registerConfirmAndLogin(
+        'logout-unauth-e2e@example.com',
+      );
+
+      const malformedRes = await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Authorization', 'Bearer invalid-token')
+        .expect(401);
+      expect((malformedRes.body as ErrorResponseBody).statusCode).toBe(401);
+
+      const refreshSecretRes = await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Authorization', `Bearer ${refresh_token}`)
+        .expect(401);
+      expect((refreshSecretRes.body as ErrorResponseBody).statusCode).toBe(401);
+
+      const expiredAccessToken = jwtService.sign(
+        { sub: userId, email: 'logout-unauth-e2e@example.com' },
+        { expiresIn: '-1s' },
+      );
+      const expiredRes = await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Authorization', `Bearer ${expiredAccessToken}`)
+        .expect(401);
+      expect((expiredRes.body as ErrorResponseBody).statusCode).toBe(401);
+
+      const storedToken = await dataSource
+        .getRepository(RefreshToken)
+        .findOneBy({ user_id: userId });
+      expect(storedToken?.revoked_at).toBeNull();
+    });
+
+    it('should return 401 INVALID_TOKEN when refreshing within 10s grace period after logout (including rotated tokens)', async () => {
+      const { access_token, refresh_token: initialRefreshToken } =
+        await registerConfirmAndLogin('logout-grace-e2e@example.com');
+
+      const rotateRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: initialRefreshToken })
+        .expect(200);
+      const rotatedRefreshToken = (rotateRes.body as LoginResponseBody)
+        .refresh_token;
+
+      await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Authorization', `Bearer ${access_token}`)
+        .expect(204);
+
+      const rotatedOutRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: initialRefreshToken })
+        .expect(401);
+      expect(rotatedOutRes.body as ErrorResponseBody).toEqual({
+        statusCode: 401,
+        error: 'INVALID_TOKEN',
+        message: 'Invalid or already used token',
+      });
+
+      const latestRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: rotatedRefreshToken })
+        .expect(401);
+      expect(latestRes.body as ErrorResponseBody).toEqual({
+        statusCode: 401,
+        error: 'INVALID_TOKEN',
+        message: 'Invalid or already used token',
+      });
+    });
+
+    it('should return 401 TOKEN_REUSE_DETECTED when refreshing a logged-out token beyond 10s grace period', async () => {
+      const { userId, access_token, refresh_token } =
+        await registerConfirmAndLogin('logout-reuse-e2e@example.com');
+
+      await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Authorization', `Bearer ${access_token}`)
+        .expect(204);
+
+      await dataSource
+        .getRepository(RefreshToken)
+        .update(
+          { user_id: userId },
+          { revoked_at: new Date(Date.now() - 11_000) },
+        );
+
+      const beyondGraceRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token })
+        .expect(401);
+      expect(beyondGraceRes.body as ErrorResponseBody).toEqual({
+        statusCode: 401,
+        error: 'TOKEN_REUSE_DETECTED',
+        message: 'Token reuse detected — all sessions revoked',
+      });
+    });
+
+    it('should not affect refresh tokens belonging to other users', async () => {
+      const userA = await registerConfirmAndLogin('logout-user-a@example.com');
+      const userB = await registerConfirmAndLogin('logout-user-b@example.com');
+
+      await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Authorization', `Bearer ${userA.access_token}`)
+        .expect(204);
+
+      const userBRefreshRes = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refresh_token: userB.refresh_token })
+        .expect(200);
+
+      const body = userBRefreshRes.body as LoginResponseBody;
+      expect(typeof body.access_token).toBe('string');
+      expect(typeof body.refresh_token).toBe('string');
+    });
+  });
 });

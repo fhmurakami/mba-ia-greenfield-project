@@ -1,5 +1,6 @@
 import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
 import { AuthService } from './auth.service';
+import { CurrentUser } from './decorators/current-user.decorator';
 import { Public } from './decorators/public.decorator';
 import { ConfirmEmailDto } from './dto/confirm-email.dto';
 import { LoginDto } from './dto/login.dto';
@@ -47,5 +48,11 @@ export class AuthController {
     @Body() dto: RefreshTokenDto,
   ): Promise<{ access_token: string; refresh_token: string }> {
     return this.authService.refresh(dto.refresh_token);
+  }
+
+  @Post('logout')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async logout(@CurrentUser('sub') userId: string): Promise<void> {
+    await this.authService.logout(userId);
   }
 }

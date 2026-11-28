@@ -266,6 +266,13 @@ export class AuthService {
     return this.handleRevokedRefreshToken(reloadedToken, rawToken, Date.now());
   }
 
+  async logout(userId: string): Promise<void> {
+    await this.refreshTokenRepository.update(
+      { user_id: userId, revoked_at: IsNull() },
+      { revoked_at: new Date(Date.now()) },
+    );
+  }
+
   private async handleRevokedRefreshToken(
     storedToken: RefreshToken,
     fallbackRawToken: string,
