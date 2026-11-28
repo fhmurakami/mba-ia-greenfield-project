@@ -7,6 +7,7 @@ import {
   Repository,
 } from 'typeorm';
 import { EmailAlreadyExistsException } from '../common/exceptions/domain.exception';
+import { normalizeEmail } from '../common/utils/email.util';
 import { Channel } from './entities/channel.entity';
 import { User } from './entities/user.entity';
 import { appendRandomSuffix, sanitizeNickname } from './nickname.util';
@@ -20,10 +21,6 @@ interface PostgresDriverError {
 const PG_UNIQUE_VIOLATION = '23505';
 const EMAIL_COLUMN = 'email';
 const NICKNAME_COLUMN = 'nickname';
-
-function normalizeEmail(email: string): string {
-  return email.trim().toLowerCase();
-}
 
 function isUniqueViolation(
   error: unknown,

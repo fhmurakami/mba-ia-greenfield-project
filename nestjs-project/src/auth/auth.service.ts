@@ -13,6 +13,7 @@ import {
   TokenExpiredException,
   TokenReuseDetectedException,
 } from '../common/exceptions/domain.exception';
+import { normalizeEmail } from '../common/utils/email.util';
 import authConfig from '../config/auth.config';
 import { MailService } from '../mail/mail.service';
 import { UsersService } from '../users/users.service';
@@ -46,7 +47,7 @@ export class AuthService {
   ) {}
 
   async register(dto: RegisterDto): Promise<{ id: string; email: string }> {
-    const normalizedEmail = dto.email.trim().toLowerCase();
+    const normalizedEmail = normalizeEmail(dto.email);
     const emailExists = await this.usersService.existsByEmail(normalizedEmail);
     if (emailExists) {
       throw new EmailAlreadyExistsException();
@@ -123,7 +124,7 @@ export class AuthService {
   }
 
   async resendConfirmation(email: string): Promise<void> {
-    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedEmail = normalizeEmail(email);
     const user = await this.usersService.findByEmail(normalizedEmail);
 
     if (!user || user.is_confirmed) {
@@ -163,7 +164,7 @@ export class AuthService {
   async login(
     dto: LoginDto,
   ): Promise<{ access_token: string; refresh_token: string }> {
-    const normalizedEmail = dto.email.trim().toLowerCase();
+    const normalizedEmail = normalizeEmail(dto.email);
     const user = await this.usersService.findByEmail(normalizedEmail);
     if (!user) {
       throw new InvalidCredentialsException();
@@ -271,7 +272,7 @@ export class AuthService {
   }
 
   async forgotPassword(email: string): Promise<void> {
-    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedEmail = normalizeEmail(email);
     const user = await this.usersService.findByEmail(normalizedEmail);
 
     if (!user) {
